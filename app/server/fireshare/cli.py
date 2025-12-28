@@ -85,8 +85,18 @@ def scan_videos(root):
         TRANSCODE_PATTERN = re.compile(r'-(?:720p|1080p)\.mp4$', re.IGNORECASE)
         
         # Collect all video files and filter out transcoded versions
-        all_files = [f for f in (videos_path / root if root else videos_path).glob('**/*') 
-                     if f.is_file() and f.suffix.lower() in SUPPORTED_FILE_EXTENSIONS]
+        all_files = []
+        for f in (videos_path / root if root else videos_path).glob('**/*'):
+            if not f.is_file() or f.suffix.lower() not in SUPPORTED_FILE_EXTENSIONS:
+                continue
+            try:
+                rel = f.relative_to(videos_path)
+                if 'uploads' in rel.parts:
+                    continue
+            except Exception:
+                if 'uploads' in str(f):
+                    continue
+            all_files.append(f)
         
         video_files = []
         skipped_count = 0

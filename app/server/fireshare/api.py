@@ -373,7 +373,9 @@ def public_upload_videoChunked():
         uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
         save_path = os.path.join(paths['video'], upload_folder, f"{name_no_type}-{uid}.{filetype}")
     
-    os.rename(tempPath, save_path)
+    #os.rename(tempPath, save_path)
+    processing_path = upload_directory / f"{filename}.processing"
+    os.replace(tempPath, processing_path)
     #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)
 
@@ -462,7 +464,7 @@ def upload_videoChunked():
     tempPath = os.path.join(upload_directory, f"{checkSum}.{filetype}.processing.part{chunkPart:04d}")
     
     # Write this specific chunk
-    with open(tempPath, 'wb') as f:
+    with open(tempPath, 'ab') as f:
         f.write(blob.read())
 
     # Check if we have all chunks
@@ -486,7 +488,8 @@ def upload_videoChunked():
 
     # Reassemble chunks in correct order
     try:
-        with open(save_path, 'wb') as output_file:
+        processing_path = upload_directory / f"{fileName}.processing"
+        with open(processing_path, 'wb') as output_file:
             for i in range(1, totalChunks + 1):
                 chunk_path = os.path.join(upload_directory, f"{checkSum}.part{i:04d}")
                 with open(chunk_path, 'rb') as chunk_file:

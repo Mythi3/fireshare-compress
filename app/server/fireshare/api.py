@@ -315,7 +315,7 @@ def public_upload_video():
         safe_name = secure_filename(filename)
         processing_name = f"{safe_name}.processing"
         processing_path = os.path.join(upload_directory, processing_name)
-    file.save(processing_path)
+        file.save(processing_path)
     #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)
 
@@ -407,7 +407,7 @@ def upload_video():
         safe_name = secure_filename(filename)
         processing_name = f"{safe_name}.processing"
         processing_path = os.path.join(upload_directory, processing_name)
-    file.save(processing_path)
+        file.save(processing_path)
     #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)
 

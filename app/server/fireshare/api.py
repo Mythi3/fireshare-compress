@@ -377,8 +377,8 @@ def public_upload_videoChunked():
         save_path = os.path.join(paths['video'], upload_folder, f"{name_no_type}-{uid}.{filetype}")
     
     #os.rename(tempPath, save_path)
-    processing_path = os.path.join(upload_directory, processing_name)
     processing_name = f"{secure_filename(filename)}.processing"
+    processing_path = os.path.join(upload_directory, processing_name)
     os.replace(tempPath, processing_path)
     #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)

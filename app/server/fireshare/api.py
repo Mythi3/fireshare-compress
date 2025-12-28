@@ -312,10 +312,14 @@ def public_upload_video():
         name_no_type = ".".join(filename.split('.')[0:-1])
         uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
         #save_path = os.path.join(paths['video'], upload_folder, f"{name_no_type}-{uid}.{filetype}")
+    try:
         safe_name = secure_filename(filename)
         processing_name = f"{safe_name}.processing"
         processing_path = os.path.join(upload_directory, processing_name)
         file.save(processing_path)
+    except Exception:
+        current_app.logger.exception("upload write failed")
+        return Response(status=500)
     #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)
 
@@ -356,7 +360,7 @@ def public_upload_videoChunked():
     upload_directory = paths['video'] / upload_folder
     if not os.path.exists(upload_directory):
         os.makedirs(upload_directory) 
-    tempPath = os.path.join(upload_directory, f"{checkSum}.{filetype}")
+    tempPath = os.path.join(upload_directory, f"{checkSum}.{filetype}.processing.part{chunkPart:04d}")
     with open(tempPath, 'ab') as f:
         f.write(blob.read())
     if chunkPart < totalChunks:
@@ -400,14 +404,20 @@ def upload_video():
     upload_directory = paths['video'] / upload_folder
     if not os.path.exists(upload_directory):
         os.makedirs(upload_directory)
-    save_path = os.path.join(upload_directory, filename)
+    # save_path = os.path.join(upload_directory, filename)
+    save_path = upload_directory / f"{filename}.processing"
+    file.save(str(save_path))
     if (os.path.exists(save_path)):
         name_no_type = ".".join(filename.split('.')[0:-1])
         uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
+    try:
         safe_name = secure_filename(filename)
         processing_name = f"{safe_name}.processing"
         processing_path = os.path.join(upload_directory, processing_name)
         file.save(processing_path)
+    except Exception:
+        current_app.logger.exception("upload write failed")
+        return Response(status=500)
     #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)
 
@@ -449,7 +459,7 @@ def upload_videoChunked():
         os.makedirs(upload_directory)
     
     # Store chunks with part number to ensure proper ordering
-    tempPath = os.path.join(upload_directory, f"{checkSum}.part{chunkPart:04d}")
+    tempPath = os.path.join(upload_directory, f"{checkSum}.{filetype}.processing.part{chunkPart:04d}")
     
     # Write this specific chunk
     with open(tempPath, 'wb') as f:

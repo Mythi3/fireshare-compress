@@ -311,9 +311,12 @@ def public_upload_video():
     if (os.path.exists(save_path)):
         name_no_type = ".".join(filename.split('.')[0:-1])
         uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
-        save_path = os.path.join(paths['video'], upload_folder, f"{name_no_type}-{uid}.{filetype}")
-    file.save(save_path)
-    Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
+        #save_path = os.path.join(paths['video'], upload_folder, f"{name_no_type}-{uid}.{filetype}")
+        safe_name = secure_filename(filename)
+        processing_name = f"{safe_name}.processing"
+        processing_path = os.path.join(VIDEOS_DIR, processing_name)
+    file.save(processing_path)
+    #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)
 
 @api.route('/api/uploadChunked/public', methods=['POST'])
@@ -367,7 +370,7 @@ def public_upload_videoChunked():
         save_path = os.path.join(paths['video'], upload_folder, f"{name_no_type}-{uid}.{filetype}")
     
     os.rename(tempPath, save_path)
-    Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
+    #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)
 
 @api.route('/api/upload', methods=['POST'])
@@ -401,9 +404,11 @@ def upload_video():
     if (os.path.exists(save_path)):
         name_no_type = ".".join(filename.split('.')[0:-1])
         uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
-        save_path = os.path.join(paths['video'], upload_folder, f"{name_no_type}-{uid}.{filetype}")
-    file.save(save_path)
-    Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
+        safe_name = secure_filename(filename)
+        processing_name = f"{safe_name}.processing"
+        processing_path = os.path.join(VIDEOS_DIR, processing_name)
+    file.save(processing_path)
+    #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)
 
 @api.route('/api/uploadChunked', methods=['POST'])
@@ -493,7 +498,7 @@ def upload_videoChunked():
             os.remove(save_path)
         return Response(status=500, response="Error reassembling file")
 
-    Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
+    #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)
 
 @api.route('/api/video')

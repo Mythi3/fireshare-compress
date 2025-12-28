@@ -353,34 +353,64 @@ def public_upload_videoChunked():
     filename = secure_filename(blob.filename)
     if not filename:
         return Response(status=400)
-    filetype = filename.split('.')[-1] # TODO, probe filetype with fmpeg instead and remux to supporrted
+    filetype = filename.split('.')[-1]
     if not filetype in SUPPORTED_FILE_TYPES:
         return Response(status=400)
      
     upload_directory = paths['video'] / upload_folder
     if not os.path.exists(upload_directory):
-        os.makedirs(upload_directory) 
+        os.makedirs(upload_directory)
+    
+    # Store individual chunk with part number
     tempPath = os.path.join(upload_directory, f"{checkSum}.{filetype}.processing.part{chunkPart:04d}")
     chunk_data = blob.read()
-    current_app.logger.info(f"public chunk {chunkPart}/{totalChunks} for {checkSum}: {len(chunk_data)} byte")
-    with open(tempPath, 'ab') as f:
+    current_app.logger.info(f"public chunk {chunkPart}/{totalChunks} for {checkSum}: {len(chunk_data)} bytes")
+    
+    # Write this specific chunk
+    with open(tempPath, 'wb') as f:
         f.write(chunk_data)
-    current_app.logger.info(f"public temp file after write: {tempPath} size={os.path.getsize(tempPath)}")
+    current_app.logger.info(f"public chunk file written: {tempPath} size={os.path.getsize(tempPath)}")
+    
+    # If not the last chunk, return 202
     if chunkPart < totalChunks:
         return Response(status=202)
     
+    # This is the last chunk - assemble all chunks
     save_path = os.path.join(upload_directory, filename)
-
-    if (os.path.exists(save_path)):
+    if os.path.exists(save_path):
         name_no_type = ".".join(filename.split('.')[0:-1])
         uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
-        save_path = os.path.join(paths['video'], upload_folder, f"{name_no_type}-{uid}.{filetype}")
+        save_path = os.path.join(upload_directory, f"{name_no_type}-{uid}.{filetype}")
     
-    #os.rename(tempPath, save_path)
+    # Create the processing file by assembling all chunks in order
     processing_name = f"{secure_filename(filename)}.processing"
     processing_path = os.path.join(upload_directory, processing_name)
-    os.replace(tempPath, processing_path)
-    #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
+    
+    try:
+        with open(processing_path, 'wb') as output_file:
+            for i in range(1, totalChunks + 1):
+                chunk_path = os.path.join(upload_directory, f"{checkSum}.{filetype}.processing.part{i:04d}")
+                if not os.path.exists(chunk_path):
+                    current_app.logger.error(f"Missing chunk {i} at {chunk_path}")
+                    return Response(status=500, response=f"Missing chunk {i}")
+                
+                with open(chunk_path, 'rb') as chunk_file:
+                    output_file.write(chunk_file.read())
+                
+                # Clean up chunk file after reading
+                os.remove(chunk_path)
+                current_app.logger.info(f"Assembled and removed chunk {i}")
+        
+        current_app.logger.info(f"public file assembled: {processing_path} size={os.path.getsize(processing_path)}")
+    except Exception as e:
+        current_app.logger.exception(f"Error assembling chunks: {e}")
+        # Clean up any remaining chunk files
+        for i in range(1, totalChunks + 1):
+            chunk_path = os.path.join(upload_directory, f"{checkSum}.{filetype}.processing.part{i:04d}")
+            if os.path.exists(chunk_path):
+                os.remove(chunk_path)
+        return Response(status=500, response="Error assembling file")
+    
     return Response(status=201)
 
 @api.route('/api/upload', methods=['POST'])
@@ -464,7 +494,7 @@ def upload_videoChunked():
     if not os.path.exists(upload_directory):
         os.makedirs(upload_directory)
     
-    # Store chunks with part number to ensure proper ordering
+    # Store individual chunk with part number
     tempPath = os.path.join(upload_directory, f"{checkSum}.{filetype}.processing.part{chunkPart:04d}")
     
     # Write this specific chunk
@@ -472,53 +502,56 @@ def upload_videoChunked():
     current_app.logger.info(f"admin chunk {chunkPart}/{totalChunks} for {checkSum}: {len(chunk_data)} bytes")
     with open(tempPath, 'wb') as f:
         f.write(chunk_data)
-    current_app.logger.info(f"admin part file written: {tempPath} size={os.path.getsize(tempPath)}")
+    current_app.logger.info(f"admin chunk file written: {tempPath} size={os.path.getsize(tempPath)}")
 
-    # Check if we have all chunks
-    chunk_files = []
-    for i in range(1, totalChunks + 1):
-        chunk_path = os.path.join(upload_directory, f"{checkSum}.part{i:04d}")
-        if os.path.exists(chunk_path):
-            chunk_files.append(chunk_path)
-    
-    # If we don't have all chunks yet, return 202
-    if len(chunk_files) != totalChunks:
+    # If not the last chunk, return 202
+    if chunkPart < totalChunks:
         return Response(status=202)
 
-    # All chunks received, reassemble the file
+    # This is the last chunk - assemble all chunks
     save_path = os.path.join(upload_directory, fileName)
-    
     if os.path.exists(save_path):
         name_no_type = ".".join(fileName.split('.')[0:-1])
         uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
         save_path = os.path.join(upload_directory, f"{name_no_type}-{uid}.{filetype}")
 
-    # Reassemble chunks in correct order
+    # Create the processing file by assembling all chunks in order
+    processing_path = upload_directory / f"{fileName}.processing"
+    
     try:
-        processing_path = upload_directory / f"{fileName}.processing"
-        with open(processing_path, 'ab') as output_file:
+        with open(processing_path, 'wb') as output_file:
             for i in range(1, totalChunks + 1):
-                chunk_path = os.path.join(upload_directory, f"{checkSum}.part{i:04d}")
+                chunk_path = os.path.join(upload_directory, f"{checkSum}.{filetype}.processing.part{i:04d}")
+                if not os.path.exists(chunk_path):
+                    current_app.logger.error(f"Missing chunk {i} at {chunk_path}")
+                    return Response(status=500, response=f"Missing chunk {i}")
+                
                 with open(chunk_path, 'rb') as chunk_file:
                     output_file.write(chunk_file.read())
-                # Clean up chunk file
+                
+                # Clean up chunk file after reading
                 os.remove(chunk_path)
+                current_app.logger.info(f"Assembled and removed chunk {i}")
         
         # Verify file size
-        if os.path.getsize(save_path) != fileSize:
-            os.remove(save_path)
-            return Response(status=500, response="File size mismatch after reassembly")
+        final_size = os.path.getsize(processing_path)
+        current_app.logger.info(f"admin file assembled: {processing_path} size={final_size}, expected={fileSize}")
+        
+        if final_size != fileSize:
+            os.remove(processing_path)
+            return Response(status=500, response=f"File size mismatch: got {final_size}, expected {fileSize}")
             
     except Exception as e:
+        current_app.logger.exception(f"Error assembling chunks: {e}")
         # Clean up on error
-        for chunk_path in chunk_files:
+        for i in range(1, totalChunks + 1):
+            chunk_path = os.path.join(upload_directory, f"{checkSum}.{filetype}.processing.part{i:04d}")
             if os.path.exists(chunk_path):
                 os.remove(chunk_path)
-        if os.path.exists(save_path):
-            os.remove(save_path)
-        return Response(status=500, response="Error reassembling file")
+        if os.path.exists(processing_path):
+            os.remove(processing_path)
+        return Response(status=500, response="Error assembling file")
 
-    #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)
 
 @api.route('/api/video')

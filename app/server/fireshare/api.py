@@ -314,7 +314,7 @@ def public_upload_video():
         #save_path = os.path.join(paths['video'], upload_folder, f"{name_no_type}-{uid}.{filetype}")
         safe_name = secure_filename(filename)
         processing_name = f"{safe_name}.processing"
-        processing_path = os.path.join(VIDEOS_DIR, processing_name)
+        processing_path = os.path.join(upload_directory, processing_name)
     file.save(processing_path)
     #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)
@@ -406,7 +406,7 @@ def upload_video():
         uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
         safe_name = secure_filename(filename)
         processing_name = f"{safe_name}.processing"
-        processing_path = os.path.join(VIDEOS_DIR, processing_name)
+        processing_path = os.path.join(upload_directory, processing_name)
     file.save(processing_path)
     #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)

@@ -361,8 +361,11 @@ def public_upload_videoChunked():
     if not os.path.exists(upload_directory):
         os.makedirs(upload_directory) 
     tempPath = os.path.join(upload_directory, f"{checkSum}.{filetype}.processing.part{chunkPart:04d}")
+    chunk_data = blob.read()
+    current_app.logger.info(f"public chunk {chunkPart}/{totalChunks} for {checkSum}: {len(chunk_data)} byte")
     with open(tempPath, 'ab') as f:
-        f.write(blob.read())
+        f.write(chunk_data)
+    current_app.logger.info(f"public temp file after write: {tempPath} size={os.path.getsize(tempPath)}")
     if chunkPart < totalChunks:
         return Response(status=202)
     
@@ -374,7 +377,8 @@ def public_upload_videoChunked():
         save_path = os.path.join(paths['video'], upload_folder, f"{name_no_type}-{uid}.{filetype}")
     
     #os.rename(tempPath, save_path)
-    processing_path = upload_directory / f"{filename}.processing"
+    processing_path = os.path.join(upload_directory, processing_name)
+    processing_name = f"{secure_filename(filename)}.processing"
     os.replace(tempPath, processing_path)
     #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)
@@ -464,8 +468,11 @@ def upload_videoChunked():
     tempPath = os.path.join(upload_directory, f"{checkSum}.{filetype}.processing.part{chunkPart:04d}")
     
     # Write this specific chunk
-    with open(tempPath, 'ab') as f:
-        f.write(blob.read())
+    chunk_data = blob.read()
+    current_app.logger.info(f"admin chunk {chunkPart}/{totalChunks} for {checkSum}: {len(chunk_data)} bytes")
+    with open(tempPath, 'wb') as f:
+        f.write(chunk_data)
+    current_app.logger.info(f"admin part file written: {tempPath} size={os.path.getsize(tempPath)}")
 
     # Check if we have all chunks
     chunk_files = []

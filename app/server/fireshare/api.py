@@ -307,13 +307,23 @@ def public_upload_video():
     upload_directory = paths['video'] / upload_folder
     if not os.path.exists(upload_directory):
         os.makedirs(upload_directory)
-    save_path = os.path.join(upload_directory, filename)
-    if (os.path.exists(save_path)):
+    
+    # Generate unique filename if file already exists
+    base_filename = filename
+    save_path = os.path.join(upload_directory, f"{base_filename}.processing")
+    if os.path.exists(os.path.join(upload_directory, base_filename)):
         name_no_type = ".".join(filename.split('.')[0:-1])
         uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
-        save_path = os.path.join(paths['video'], upload_folder, f"{name_no_type}-{uid}.{filetype}")
-    file.save(save_path)
-    Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
+        base_filename = f"{name_no_type}-{uid}.{filetype}"
+        save_path = os.path.join(upload_directory, f"{base_filename}.processing")
+    
+    try:
+        file.save(save_path)
+        current_app.logger.info(f"Public upload saved: {save_path}")
+    except Exception as e:
+        current_app.logger.exception(f"Public upload failed: {e}")
+        return Response(status=500, response="Failed to save file")
+    
     return Response(status=201)
 
 @api.route('/api/uploadChunked/public', methods=['POST'])
@@ -346,28 +356,50 @@ def public_upload_videoChunked():
     filename = secure_filename(blob.filename)
     if not filename:
         return Response(status=400)
-    filetype = filename.split('.')[-1] # TODO, probe filetype with fmpeg instead and remux to supporrted
+    filetype = filename.split('.')[-1]
     if not filetype in SUPPORTED_FILE_TYPES:
         return Response(status=400)
      
     upload_directory = paths['video'] / upload_folder
     if not os.path.exists(upload_directory):
-        os.makedirs(upload_directory) 
-    tempPath = os.path.join(upload_directory, f"{checkSum}.{filetype}")
-    with open(tempPath, 'ab') as f:
-        f.write(blob.read())
+        os.makedirs(upload_directory)
+    
+    # Write chunk to temporary file
+    tempPath = os.path.join(upload_directory, f"{checkSum}.{filetype}.tmp")
+    try:
+        with open(tempPath, 'ab') as f:
+            chunk_data = blob.read()
+            f.write(chunk_data)
+        current_app.logger.info(f"Public chunk {chunkPart}/{totalChunks} written: {len(chunk_data)} bytes")
+    except Exception as e:
+        current_app.logger.exception(f"Failed to write public chunk {chunkPart}: {e}")
+        return Response(status=500, response="Failed to write chunk")
+    
+    # If not the last chunk, return 202 Accepted
     if chunkPart < totalChunks:
         return Response(status=202)
     
-    save_path = os.path.join(upload_directory, filename)
-
-    if (os.path.exists(save_path)):
+    # This is the last chunk - finalize the upload
+    base_filename = filename
+    final_path = os.path.join(upload_directory, f"{base_filename}.processing")
+    
+    # Generate unique filename if file already exists
+    if os.path.exists(os.path.join(upload_directory, base_filename)):
         name_no_type = ".".join(filename.split('.')[0:-1])
         uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
-        save_path = os.path.join(paths['video'], upload_folder, f"{name_no_type}-{uid}.{filetype}")
+        base_filename = f"{name_no_type}-{uid}.{filetype}"
+        final_path = os.path.join(upload_directory, f"{base_filename}.processing")
     
-    os.rename(tempPath, save_path)
-    Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
+    try:
+        # Rename temp file to final processing file
+        os.rename(tempPath, final_path)
+        current_app.logger.info(f"Public chunked upload completed: {final_path} ({os.path.getsize(final_path)} bytes)")
+    except Exception as e:
+        current_app.logger.exception(f"Failed to finalize public upload: {e}")
+        if os.path.exists(tempPath):
+            os.remove(tempPath)
+        return Response(status=500, response="Failed to finalize upload")
+    
     return Response(status=201)
 
 @api.route('/api/upload', methods=['POST'])
@@ -397,13 +429,23 @@ def upload_video():
     upload_directory = paths['video'] / upload_folder
     if not os.path.exists(upload_directory):
         os.makedirs(upload_directory)
-    save_path = os.path.join(upload_directory, filename)
-    if (os.path.exists(save_path)):
+    
+    # Generate unique filename if file already exists
+    base_filename = filename
+    save_path = os.path.join(upload_directory, f"{base_filename}.processing")
+    if os.path.exists(os.path.join(upload_directory, base_filename)):
         name_no_type = ".".join(filename.split('.')[0:-1])
         uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
-        save_path = os.path.join(paths['video'], upload_folder, f"{name_no_type}-{uid}.{filetype}")
-    file.save(save_path)
-    Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
+        base_filename = f"{name_no_type}-{uid}.{filetype}"
+        save_path = os.path.join(upload_directory, f"{base_filename}.processing")
+    
+    try:
+        file.save(save_path)
+        current_app.logger.info(f"Admin upload saved: {save_path}")
+    except Exception as e:
+        current_app.logger.exception(f"Admin upload failed: {e}")
+        return Response(status=500, response="Failed to save file")
+    
     return Response(status=201)
 
 @api.route('/api/uploadChunked', methods=['POST'])
@@ -443,12 +485,18 @@ def upload_videoChunked():
     if not os.path.exists(upload_directory):
         os.makedirs(upload_directory)
     
-    # Store chunks with part number to ensure proper ordering
+    # Store each chunk as a separate part file for reliability
     tempPath = os.path.join(upload_directory, f"{checkSum}.part{chunkPart:04d}")
     
-    # Write this specific chunk
-    with open(tempPath, 'wb') as f:
-        f.write(blob.read())
+    try:
+        # Write this specific chunk
+        chunk_data = blob.read()
+        with open(tempPath, 'wb') as f:
+            f.write(chunk_data)
+        current_app.logger.info(f"Admin chunk {chunkPart}/{totalChunks} written: {len(chunk_data)} bytes")
+    except Exception as e:
+        current_app.logger.exception(f"Failed to write admin chunk {chunkPart}: {e}")
+        return Response(status=500, response="Failed to write chunk")
 
     # Check if we have all chunks
     chunk_files = []
@@ -457,43 +505,57 @@ def upload_videoChunked():
         if os.path.exists(chunk_path):
             chunk_files.append(chunk_path)
     
-    # If we don't have all chunks yet, return 202
+    # If we don't have all chunks yet, return 202 Accepted
     if len(chunk_files) != totalChunks:
         return Response(status=202)
 
-    # All chunks received, reassemble the file
-    save_path = os.path.join(upload_directory, fileName)
+    # All chunks received - reassemble the file
+    base_filename = fileName
+    final_path = os.path.join(upload_directory, f"{base_filename}.processing")
     
-    if os.path.exists(save_path):
+    # Generate unique filename if file already exists
+    if os.path.exists(os.path.join(upload_directory, base_filename)):
         name_no_type = ".".join(fileName.split('.')[0:-1])
         uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
-        save_path = os.path.join(upload_directory, f"{name_no_type}-{uid}.{filetype}")
+        base_filename = f"{name_no_type}-{uid}.{filetype}"
+        final_path = os.path.join(upload_directory, f"{base_filename}.processing")
 
     # Reassemble chunks in correct order
     try:
-        with open(save_path, 'wb') as output_file:
+        with open(final_path, 'wb') as output_file:
             for i in range(1, totalChunks + 1):
                 chunk_path = os.path.join(upload_directory, f"{checkSum}.part{i:04d}")
                 with open(chunk_path, 'rb') as chunk_file:
                     output_file.write(chunk_file.read())
-                # Clean up chunk file
+                # Clean up chunk file after reading
                 os.remove(chunk_path)
+                current_app.logger.info(f"Assembled chunk {i}/{totalChunks}")
         
         # Verify file size
-        if os.path.getsize(save_path) != fileSize:
-            os.remove(save_path)
+        actual_size = os.path.getsize(final_path)
+        if actual_size != fileSize:
+            current_app.logger.error(f"File size mismatch: expected {fileSize}, got {actual_size}")
+            os.remove(final_path)
             return Response(status=500, response="File size mismatch after reassembly")
+        
+        current_app.logger.info(f"Admin chunked upload completed: {final_path} ({actual_size} bytes)")
             
     except Exception as e:
+        current_app.logger.exception(f"Failed to reassemble admin upload: {e}")
         # Clean up on error
         for chunk_path in chunk_files:
             if os.path.exists(chunk_path):
-                os.remove(chunk_path)
-        if os.path.exists(save_path):
-            os.remove(save_path)
+                try:
+                    os.remove(chunk_path)
+                except:
+                    pass
+        if os.path.exists(final_path):
+            try:
+                os.remove(final_path)
+            except:
+                pass
         return Response(status=500, response="Error reassembling file")
 
-    Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)
 
 @api.route('/api/video')

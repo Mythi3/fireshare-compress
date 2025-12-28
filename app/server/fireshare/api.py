@@ -307,11 +307,7 @@ def public_upload_video():
     upload_directory = paths['video'] / upload_folder
     if not os.path.exists(upload_directory):
         os.makedirs(upload_directory)
-    save_path = os.path.join(upload_directory, filename)
-    if (os.path.exists(save_path)):
-        name_no_type = ".".join(filename.split('.')[0:-1])
-        uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
-        #save_path = os.path.join(paths['video'], upload_folder, f"{name_no_type}-{uid}.{filetype}")
+    
     try:
         safe_name = secure_filename(filename)
         processing_name = f"{safe_name}.processing"
@@ -320,7 +316,6 @@ def public_upload_video():
     except Exception:
         current_app.logger.exception("upload write failed")
         return Response(status=500)
-    #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)
 
 @api.route('/api/uploadChunked/public', methods=['POST'])
@@ -376,13 +371,6 @@ def public_upload_videoChunked():
         return Response(status=202)
     
     # This is the last chunk - assemble all chunks
-    save_path = os.path.join(upload_directory, filename)
-    if os.path.exists(save_path):
-        name_no_type = ".".join(filename.split('.')[0:-1])
-        uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
-        save_path = os.path.join(upload_directory, f"{name_no_type}-{uid}.{filetype}")
-    
-    # Create the processing file by assembling all chunks in order
     processing_name = f"{secure_filename(filename)}.processing"
     processing_path = os.path.join(upload_directory, processing_name)
     
@@ -440,12 +428,7 @@ def upload_video():
     upload_directory = paths['video'] / upload_folder
     if not os.path.exists(upload_directory):
         os.makedirs(upload_directory)
-    # save_path = os.path.join(upload_directory, filename)
-    save_path = upload_directory / f"{filename}.processing"
-    file.save(str(save_path))
-    if (os.path.exists(save_path)):
-        name_no_type = ".".join(filename.split('.')[0:-1])
-        uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
+    
     try:
         safe_name = secure_filename(filename)
         processing_name = f"{safe_name}.processing"
@@ -454,7 +437,6 @@ def upload_video():
     except Exception:
         current_app.logger.exception("upload write failed")
         return Response(status=500)
-    #Popen(["fireshare", "scan-video", f"--path={save_path}"], shell=False)
     return Response(status=201)
 
 @api.route('/api/uploadChunked', methods=['POST'])
@@ -509,13 +491,6 @@ def upload_videoChunked():
         return Response(status=202)
 
     # This is the last chunk - assemble all chunks
-    save_path = os.path.join(upload_directory, fileName)
-    if os.path.exists(save_path):
-        name_no_type = ".".join(fileName.split('.')[0:-1])
-        uid = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
-        save_path = os.path.join(upload_directory, f"{name_no_type}-{uid}.{filetype}")
-
-    # Create the processing file by assembling all chunks in order
     processing_path = upload_directory / f"{fileName}.processing"
     
     try:
@@ -623,4 +598,4 @@ def folder_size():
 @api.after_request
 def after_request(response):
     response.headers.add('Accept-Ranges', 'bytes')
-    return response
+    return Response(status=201)

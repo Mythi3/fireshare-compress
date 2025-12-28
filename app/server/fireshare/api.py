@@ -489,7 +489,7 @@ def upload_videoChunked():
     # Reassemble chunks in correct order
     try:
         processing_path = upload_directory / f"{fileName}.processing"
-        with open(processing_path, 'wb') as output_file:
+        with open(processing_path, 'ab') as output_file:
             for i in range(1, totalChunks + 1):
                 chunk_path = os.path.join(upload_directory, f"{checkSum}.part{i:04d}")
                 with open(chunk_path, 'rb') as chunk_file:

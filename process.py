@@ -1,334 +1,299 @@
 #!/usr/bin/env python3
 """
-Fireshare Video Processor
-- Watches a directory for files that end with .processing or .processed (commonly written
-  as original.mp4.processing)
-- Waits until the source file stops changing (fully written)
-- Moves the file to a temp directory
-- Renames it to remove the .processing/.processed suffix (becomes .mp4)
-- Strips metadata and compresses with ffmpeg (single pass)
-- Moves the compressed file to the output directory
-- Triggers a fireshare scan on the moved file
+Refined Fireshare processing script
+
+Goals implemented:
+- Separate incoming (watch) and fireshare videos (output) directories to ensure Fireshare treats files as new
+- Wait for stable file size before moving/process
+- Move to atomic temp location, strip suffix (.processing/.processed) to .mp4
+- Compress + strip metadata using ffmpeg (CRF-based H.264) with safe filtering
+- Create unique filenames for the final file (UUID + timestamp) to avoid Fireshare dedupe
+- Run `fireshare scan-video --path <file>` synchronously and capture output
+- Robust logging, error handling, and cleanup
+- Command-line flags + environment friendly
+
+Dependencies:
+- ffmpeg & ffprobe in PATH
+- watchdog (pip install watchdog)
+
+Usage example:
+  process.py --watch-dir /mnt/incoming --output-dir /mnt/fireshare/videos --temp-dir /mnt/temp
+
 """
 
+from __future__ import annotations
 import argparse
-import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
-from datetime import datetime
+from typing import Optional
 
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+except Exception:
+    print("Missing dependency: watchdog. Install with `pip install watchdog`.")
+    raise
 
 # ---------- Logging ----------
+LOG_FILE = "fireshare_processor.log"
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("fireshare_processor.log"),
+        logging.FileHandler(LOG_FILE),
         logging.StreamHandler(sys.stdout),
     ],
 )
 logger = logging.getLogger("fireshare_processor")
 
-# ---------- Quality presets ----------
-QUALITY_PRESETS = {
-    "low": {
-        "1080p": {"resolution": (1920, 1080), "crf": "28", "preset": "fast", "audio_bitrate": "128k"},
-        "720p": {"resolution": (1280, 720), "crf": "28", "preset": "fast", "audio_bitrate": "128k"},
-    },
-    "medium": {
-        "1080p": {"resolution": (1920, 1080), "crf": "23", "preset": "medium", "audio_bitrate": "192k"},
-        "720p": {"resolution": (1280, 720), "crf": "23", "preset": "medium", "audio_bitrate": "192k"},
-    },
-    "high": {
-        "1080p": {"resolution": (1920, 1080), "crf": "20", "preset": "slow", "audio_bitrate": "256k"},
-        "720p": {"resolution": (1280, 720), "crf": "20", "preset": "slow", "audio_bitrate": "256k"},
-    },
+# ---------- Constants and presets ----------
+VIDEO_SUFFIXES = (".mp4.processing", ".mp4.processed")
+DEFAULT_CHECK_INTERVAL = 2.0
+DEFAULT_STABLE_CHECKS = 3
+DEFAULT_TIMEOUT = 300
+
+FFMPEG_DEFAULT = {
+    "vcodec": "libx264",
+    "crf": "23",
+    "preset": "medium",
+    "audio_bitrate": "192k",
 }
 
+# ---------- Helpers ----------
+
+def is_processing_file(p: Path) -> bool:
+    """Return True if filename ends with a recognized processing suffix."""
+    return any(p.name.lower().endswith(suffix) for suffix in VIDEO_SUFFIXES)
+
+
+def stable_file_wait(path: Path, timeout: int = DEFAULT_TIMEOUT, interval: float = DEFAULT_CHECK_INTERVAL, stable_checks: int = DEFAULT_STABLE_CHECKS) -> bool:
+    """Wait until the file size is stable for `stable_checks` checks or until timeout.
+    Returns True if stable, False if timed out or file missing.
+    """
+    start = time.time()
+    last_size = -1
+    stable = 0
+    while time.time() - start < timeout:
+        if not path.exists():
+            logger.warning("File disappeared while waiting for stability: %s", path)
+            return False
+        try:
+            size = path.stat().st_size
+        except Exception as exc:
+            logger.debug("stat failed for %s: %s", path, exc)
+            size = -1
+        if size > 0 and size == last_size:
+            stable += 1
+            if stable >= stable_checks:
+                logger.info("File stabilized: %s (%d bytes)", path.name, size)
+                return True
+        else:
+            stable = 0
+        last_size = size
+        time.sleep(interval)
+    logger.error("Timeout waiting for file stability: %s", path)
+    return False
+
+
+def unique_name(dst_dir: Path, base_name: str) -> Path:
+    """Return an available unique path in dst_dir using uuid + timestamp prefix.
+    Keeps original suffix.
+    """
+    suffix = Path(base_name).suffix
+    stem = Path(base_name).stem
+    unique = f"{int(time.time())}_{uuid.uuid4().hex}_{stem}{suffix}"
+    return dst_dir / unique
 
 # ---------- Video processing ----------
 class VideoProcessor:
-    def __init__(self, quality="medium", resolution="1080p", temp_dir=None):
-        if quality not in QUALITY_PRESETS:
-            raise ValueError(f"Invalid quality: {quality}. Choices: {list(QUALITY_PRESETS.keys())}")
-        if resolution not in QUALITY_PRESETS[quality]:
-            raise ValueError(f"Invalid resolution: {resolution}. Choices: {list(QUALITY_PRESETS[quality].keys())}")
-
-        self.quality = quality
-        self.resolution = resolution
-        self.preset = QUALITY_PRESETS[quality][resolution]
-        self.temp_dir = Path(temp_dir) if temp_dir else Path(os.path.expanduser("~/fireshare/temp"))
+    def __init__(self, temp_dir: Path, ffmpeg_opts: dict | None = None):
+        self.temp_dir = temp_dir
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.ffmpeg_opts = ffmpeg_opts or FFMPEG_DEFAULT
 
-        logger.info(f"VideoProcessor initialized: quality={quality}, resolution={resolution}, temp={self.temp_dir}")
-
-    def compress_and_strip(self, input_path: Path, output_path: Path) -> bool:
-        """
-        Run ffmpeg to strip metadata and compress into output_path.
-        Returns True on success.
-        """
-        input_path = Path(input_path)
-        output_path = Path(output_path)
-
-        if not input_path.exists():
-            logger.error("Input for compression does not exist: %s", input_path)
+    def ffmpeg_available(self) -> bool:
+        try:
+            subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            subprocess.run(["ffprobe", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            return True
+        except Exception:
             return False
 
-        width, height = self.preset["resolution"]
-        crf = self.preset["crf"]
-        preset = self.preset["preset"]
-        audio_bitrate = self.preset["audio_bitrate"]
+    def compress_and_strip(self, src: Path, dst: Path, width: Optional[int] = None, height: Optional[int] = None) -> bool:
+        """Run ffmpeg to strip metadata and compress into dst path. Returns True on success."""
+        if not src.exists():
+            logger.error("Source missing for compression: %s", src)
+            return False
 
-        # scale & pad to the requested resolution while preserving aspect ratio
-        vf = f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+        # Build a vf string only if both width and height provided
+        vf = None
+        if width and height:
+            vf = f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
 
         cmd = [
             "ffmpeg",
             "-hide_banner",
             "-y",
-            "-i", str(input_path),
-            "-map_metadata", "-1",        # strip metadata
-            "-map_chapters", "-1",       # strip chapters
-            "-vf", vf,
-            "-c:v", "libx264",
-            "-preset", preset,
-            "-crf", crf,
+            "-i",
+            str(src),
+            "-map_metadata", "-1",
+            "-map_chapters", "-1",
+        ]
+        if vf:
+            cmd += ["-vf", vf]
+        cmd += [
+            "-c:v", self.ffmpeg_opts.get("vcodec", "libx264"),
+            "-preset", self.ffmpeg_opts.get("preset", "medium"),
+            "-crf", str(self.ffmpeg_opts.get("crf", "23")),
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
-            "-b:a", audio_bitrate,
+            "-b:a", self.ffmpeg_opts.get("audio_bitrate", "192k"),
             "-movflags", "+faststart",
-            str(output_path),
+            str(dst),
         ]
 
-        logger.info("Running ffmpeg: %s -> %s", input_path.name, output_path.name)
-        logger.debug("ffmpeg cmd: %s", " ".join(cmd))
-
+        logger.info("ffmpeg command: %s %s -> %s", cmd[0], src.name, dst.name)
         try:
-            # Capture stderr to show ffmpeg progress logs
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, universal_newlines=True)
-            stderr_lines = []
-            # read stderr continuously
-            while True:
-                line = process.stderr.readline()
-                if not line and process.poll() is not None:
-                    break
-                if line:
-                    stderr_lines.append(line)
-                    # log periodic progress lines at debug level
-                    if "frame=" in line or "time=" in line or "speed=" in line:
-                        logger.debug(line.strip())
-            process.wait()
-            if process.returncode != 0:
-                logger.error("ffmpeg returned non-zero (%s). Last lines:\n%s", process.returncode, "".join(stderr_lines[-40:]))
+            completed = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if completed.returncode != 0:
+                logger.error("ffmpeg failed (%d): %s", completed.returncode, completed.stderr[-1000:])
                 return False
-
-            # Validate output
-            if not output_path.exists() or output_path.stat().st_size == 0:
-                logger.error("ffmpeg produced empty or missing output: %s", output_path)
+            if not dst.exists() or dst.stat().st_size == 0:
+                logger.error("ffmpeg produced no output: %s", dst)
                 return False
-
-            orig_size = input_path.stat().st_size
-            new_size = output_path.stat().st_size
-            reduction = (1.0 - (new_size / orig_size)) * 100 if orig_size > 0 else 0.0
-            logger.info("Compression finished: %s (%.1f%% reduction)", output_path.name, reduction)
+            orig = src.stat().st_size
+            new = dst.stat().st_size
+            if orig > 0:
+                reduction = (1.0 - (new / orig)) * 100.0
+                logger.info("Compression finished: %s (reduction %.1f%%)", dst.name, reduction)
+            else:
+                logger.info("Compression finished: %s", dst.name)
             return True
-
-        except Exception as e:
-            logger.exception("Compression failed: %s", e)
+        except Exception as exc:
+            logger.exception("Exception running ffmpeg: %s", exc)
             return False
 
-
-# ---------- File system event handler ----------
+# ---------- FS Event Handler ----------
 class ProcessingFileHandler(FileSystemEventHandler):
-    """
-    Reacts to new .processing/.processed files.
-    Workflow:
-      - Wait for source size to stabilize
-      - Move to temp folder
-      - Rename to remove .processing/.processed -> becomes original .mp4
-      - Compress/strip into a temp output file
-      - Move compressed file to output directory (unique name)
-      - Trigger fireshare scan
-    """
-
     def __init__(self, processor: VideoProcessor, watch_dir: Path, output_dir: Path, temp_dir: Path):
         self.processor = processor
-        self.watch_dir = Path(watch_dir)
-        self.output_dir = Path(output_dir)
-        self.temp_dir = Path(temp_dir)
-        self.processing_files = set()
-
-    @staticmethod
-    def _is_processing_file(path: Path):
-        # Accept suffix .processing or .processed (common variants). The file should include ".mp4" before suffix.
-        name = path.name
-        lower = name.lower()
-        return (lower.endswith(".mp4.processing") or lower.endswith(".mp4.processed"))
+        self.watch_dir = watch_dir
+        self.output_dir = output_dir
+        self.temp_dir = temp_dir
+        self._processing = set()
 
     def on_created(self, event):
         if event.is_directory:
             return
-        src = Path(event.src_path)
-        if not self._is_processing_file(src):
-            return
-        logger.info("Created: %s", src)
-        self._handle(src)
+        p = Path(event.src_path)
+        if is_processing_file(p):
+            logger.info("Detected new processing file: %s", p)
+            self._handle(p)
 
     def on_moved(self, event):
-        # handle moved/renamed into the watched folder
         if event.is_directory:
             return
-        dest = Path(event.dest_path)
-        if not self._is_processing_file(dest):
+        p = Path(event.dest_path)
+        if is_processing_file(p):
+            logger.info("Detected moved/renamed processing file: %s", p)
+            self._handle(p)
+
+    def _handle(self, src: Path):
+        key = str(src.resolve())
+        if key in self._processing:
+            logger.info("Already processing: %s", src)
             return
-        logger.info("Moved/renamed: %s", dest)
-        self._handle(dest)
-
-    def _wait_for_stable(self, path: Path, timeout=300, interval=2, stable_checks=3) -> bool:
-        """
-        Wait until size is stable for `stable_checks` consecutive checks.
-        """
-        logger.info("Waiting for completion (stable size) of %s", path)
-        start = time.time()
-        last_size = -1
-        stable = 0
-        while time.time() - start < timeout:
-            if not path.exists():
-                logger.warning("File disappeared while waiting: %s", path)
-                return False
-            try:
-                size = path.stat().st_size
-            except Exception as e:
-                logger.debug("Stat failed: %s", e)
-                size = -1
-
-            if size == last_size and size > 0:
-                stable += 1
-                if stable >= stable_checks:
-                    logger.info("File appears complete: %s (%d bytes)", path.name, size)
-                    return True
-            else:
-                stable = 0
-            last_size = size
-            time.sleep(interval)
-
-        logger.error("Timeout waiting for file to stabilize: %s", path)
-        return False
-
-    def _unique_target(self, target: Path) -> Path:
-        """
-        If target exists, append _1, _2, ... before suffix to make unique.
-        """
-        if not target.exists():
-            return target
-        base = target.stem
-        suffix = target.suffix  # e.g., '.mp4'
-        parent = target.parent
-        counter = 1
-        while True:
-            candidate = parent / f"{base}_{counter}{suffix}"
-            if not candidate.exists():
-                return candidate
-            counter += 1
-
-    def _handle(self, src_path: Path):
-        str_src = str(src_path.resolve())
-        if str_src in self.processing_files:
-            logger.info("Already processing: %s", src_path)
-            return
-        self.processing_files.add(str_src)
-
+        self._processing.add(key)
         try:
-            # Ensure file finished writing in the watch location before move
-            if not self._wait_for_stable(src_path):
-                logger.error("Source file not stable or disappeared: %s", src_path)
+            # Wait until source file is stable
+            if not stable_file_wait(src):
+                logger.error("Source didn't stabilize: %s", src)
                 return
 
-            # Move the file to temp directory (preserve name initially)
-            temp_move_path = self.temp_dir / src_path.name
+            # Move to temp directory (use shutil.move which handles cross-device)
+            temp_move = self.temp_dir / src.name
             try:
-                logger.info("Moving %s -> %s", src_path, temp_move_path)
-                shutil.move(str(src_path), str(temp_move_path))
-            except Exception as e:
-                logger.exception("Failed to move to temp: %s", e)
+                logger.info("Moving to temp: %s -> %s", src, temp_move)
+                shutil.move(str(src), str(temp_move))
+            except Exception as exc:
+                logger.exception("Move to temp failed: %s", exc)
                 return
 
-            # Determine mp4 name by removing processing suffix
-            name = temp_move_path.name
-            if name.lower().endswith(".mp4.processing"):
-                mp4_name = name[:-len(".processing")]
-            elif name.lower().endswith(".mp4.processed"):
-                mp4_name = name[:-len(".processed")]
-            else:
-                # Unexpected, but keep original
-                mp4_name = name
-
-            temp_mp4_path = self.temp_dir / mp4_name
-            # Rename to remove the suffix
+            # Remove suffix (.processing/.processed) to mp4 name
+            name = temp_move.name
+            mp4_name = name
+            for s in VIDEO_SUFFIXES:
+                if name.lower().endswith(s):
+                    mp4_name = name[:-len(s)]
+                    break
+            temp_mp4 = self.temp_dir / mp4_name
             try:
-                logger.info("Renaming in temp: %s -> %s", temp_move_path.name, temp_mp4_path.name)
-                temp_move_path.rename(temp_mp4_path)
-            except Exception as e:
-                logger.exception("Rename in temp failed: %s", e)
-                # try to continue by using the moved file as-is
-                temp_mp4_path = temp_move_path
+                logger.info("Rename in temp: %s -> %s", temp_move.name, temp_mp4.name)
+                temp_move.rename(temp_mp4)
+            except Exception:
+                logger.warning("Rename failed, will continue with moved file as-is")
+                temp_mp4 = temp_move
 
-            # Prepare compressed output name in temp
-            compressed_temp = self.temp_dir / f"compressed_{int(time.time())}_{temp_mp4_path.name}"
-            # Run compression + metadata strip
-            ok = self.processor.compress_and_strip(temp_mp4_path, compressed_temp)
+            # Prepare compressed output in temp
+            compressed_temp = self.temp_dir / f"compressed_{int(time.time())}_{uuid.uuid4().hex}_{temp_mp4.name}"
+            ok = self.processor.compress_and_strip(temp_mp4, compressed_temp)
             if not ok:
-                logger.error("Processing failed for %s", temp_mp4_path)
-                # leave original or try cleanup
+                logger.error("Compression failed for %s", temp_mp4)
                 return
 
-            # Move compressed file back to the output directory
-            final_target = self.output_dir / compressed_temp.name
-            final_target = self._unique_target(final_target)
+            # Move compressed file into Fireshare watched output with a unique filename
+            final_target = unique_name(self.output_dir, temp_mp4.name)
             try:
-                logger.info("Moving compressed -> output: %s -> %s", compressed_temp, final_target)
+                logger.info("Moving compressed to output: %s -> %s", compressed_temp, final_target)
                 shutil.move(str(compressed_temp), str(final_target))
-            except Exception as e:
-                logger.exception("Failed to move compressed to output: %s", e)
+            except Exception as exc:
+                logger.exception("Failed to move compressed to output: %s", exc)
                 return
 
-            # Trigger fireshare scan
+            # Trigger fireshare scan synchronously and capture output
             try:
-                logger.info("Triggering fireshare scan for: %s", final_target)
-                subprocess.Popen(["fireshare", "scan-video", f"--path={final_target}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            except Exception as e:
-                logger.warning("Could not trigger fireshare scan: %s", e)
+                scan_cmd = ["fireshare", "scan-video", "--path", str(final_target)]
+                logger.info("Running scan: %s", " ".join(scan_cmd))
+                res = subprocess.run(scan_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                logger.info("fireshare scan exit=%s stdout=%s stderr=%s", res.returncode, (res.stdout or "").strip(), (res.stderr or "").strip())
+                if res.returncode != 0:
+                    logger.warning("fireshare scan may have failed for %s", final_target)
+            except Exception as exc:
+                logger.warning("Failed to run fireshare scan: %s", exc)
 
-            logger.info("Processing completed: %s", final_target)
+            logger.info("Finished processing %s", final_target)
 
         finally:
-            # cleanup temp source if still present
+            # Cleanup: remove source temp_mp4 if still exists
             try:
-                # remove temp original mp4 if exists
-                if 'temp_mp4_path' in locals() and temp_mp4_path.exists():
-                    temp_mp4_path.unlink()
+                if 'temp_mp4' in locals() and temp_mp4.exists():
+                    temp_mp4.unlink()
             except Exception:
                 pass
-            self.processing_files.discard(str_src)
+            self._processing.discard(key)
+
+# ---------- Main / CLI ----------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Fireshare video processing watcher")
+    p.add_argument("--watch-dir", default="~/fireshare/incoming", help="Directory to watch for .mp4.processing files")
+    p.add_argument("--output-dir", default="~/fireshare/videos", help="Directory Fireshare watches (final MP4s go here)")
+    p.add_argument("--temp-dir", default="~/fireshare/temp", help="Temp working directory")
+    p.add_argument("--crf", type=int, default=23, help="CRF for compression (lower = better quality)")
+    p.add_argument("--preset", default="medium", help="ffmpeg preset")
+    p.add_argument("--audio-bitrate", default="192k")
+    p.add_argument("--once", action="store_true", help="Process matching files once and exit (no watcher)")
+    return p.parse_args()
 
 
-# ---------- CLI / main ----------
 def main():
-    parser = argparse.ArgumentParser(description="Fireshare video processor (monitor + compress)")
-    parser.add_argument("--quality", choices=["low", "medium", "high"], default="medium")
-    parser.add_argument("--resolution", choices=["720p", "1080p"], default="1080p")
-    parser.add_argument("--watch-dir", default="~/fireshare/clips/uploads")
-    parser.add_argument("--output-dir", default="~/fireshare/clips/uploads")
-    parser.add_argument("--temp-dir", default="~/fireshare/clips/temp")
-    args = parser.parse_args()
-
+    args = parse_args()
     watch_dir = Path(os.path.expanduser(args.watch_dir)).resolve()
     output_dir = Path(os.path.expanduser(args.output_dir)).resolve()
     temp_dir = Path(os.path.expanduser(args.temp_dir)).resolve()
@@ -337,40 +302,34 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Starting Fireshare processor")
-    logger.info("Watch dir: %s", watch_dir)
-    logger.info("Output dir: %s", output_dir)
-    logger.info("Temp dir: %s", temp_dir)
-    logger.info("Quality: %s, Resolution: %s", args.quality, args.resolution)
+    ffmpeg_opts = {"vcodec": "libx264", "crf": args.crf, "preset": args.preset, "audio_bitrate": args.audio_bitrate}
+    processor = VideoProcessor(temp_dir=temp_dir, ffmpeg_opts=ffmpeg_opts)
 
-    # check ffmpeg availability
-    try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        subprocess.run(["ffprobe", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    except Exception:
-        logger.error("ffmpeg/ffprobe not found or not in PATH. Install ffmpeg.")
+    if not processor.ffmpeg_available():
+        logger.error("ffmpeg/ffprobe not available in PATH. Aborting.")
         sys.exit(1)
 
-    # warn if fireshare command missing, but continue
-    try:
-        subprocess.run(["fireshare", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    except Exception:
-        logger.warning("fireshare command not found in PATH; scan triggers will likely fail.")
-
-    processor = VideoProcessor(quality=args.quality, resolution=args.resolution, temp_dir=temp_dir)
     handler = ProcessingFileHandler(processor=processor, watch_dir=watch_dir, output_dir=output_dir, temp_dir=temp_dir)
+
+    if args.once:
+        # Run one pass: process existing files in watch_dir that match
+        for p in watch_dir.iterdir():
+            if p.is_file() and is_processing_file(p):
+                handler._handle(p)
+        logger.info("One-shot processing complete.")
+        return
+
     observer = Observer()
     observer.schedule(handler, str(watch_dir), recursive=False)
     observer.start()
+    logger.info("Watching %s -> output %s (temp: %s)", watch_dir, output_dir, temp_dir)
     try:
-        logger.info("Monitoring started. Press Ctrl+C to stop.")
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        logger.info("Stopping monitor...")
+        logger.info("Shutting down...")
         observer.stop()
     observer.join()
-    logger.info("Monitor stopped.")
 
 
 if __name__ == "__main__":

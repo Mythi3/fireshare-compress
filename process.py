@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-Refined Fireshare processing script
+Refined Fireshare processing script — fixed to ensure ffmpeg never receives files with a ".processing" suffix.
 
-Goals implemented:
-- Separate incoming (watch) and fireshare videos (output) directories to ensure Fireshare treats files as new
-- Wait for stable file size before moving/process
-- Move to atomic temp location, strip suffix (.processing/.processed) to .mp4
-- Compress + strip metadata using ffmpeg (CRF-based H.264) with safe filtering
-- Create unique filenames for the final file (UUID + timestamp) to avoid Fireshare dedupe
-- Run `fireshare scan-video --path <file>` synchronously and capture output
-- Robust logging, error handling, and cleanup
-- Command-line flags + environment friendly
+Behavioral summary:
+- Watch for incoming files that end with ".mp4.processing" or ".mp4.processed" in the watch directory
+- Wait until file size stabilizes (upload finished)
+- Move the file to a temp directory (atomic move) and rename it to remove the ".processing" suffix (so ffmpeg sees a normal .mp4)
+- Compress + strip metadata in temp
+- Move final uniquely-named MP4 into the Fireshare watched output directory
+- Trigger `fireshare scan-video --path` synchronously and log output
+
+Usage:
+  ./process.py --watch-dir ~/fireshare/clips/uploads --output-dir ~/fireshare/clips/videos --temp-dir ~/fireshare/clips/temp
 
 Dependencies:
-- ffmpeg & ffprobe in PATH
+- python3
 - watchdog (pip install watchdog)
-
-Usage example:
-  process.py --watch-dir /mnt/incoming --output-dir /mnt/fireshare/videos --temp-dir /mnt/temp
+- ffmpeg & ffprobe in PATH
+- fireshare CLI for scan triggering (optional — script will still produce file)
 
 """
 
@@ -52,7 +52,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fireshare_processor")
 
-# ---------- Constants and presets ----------
+# ---------- Constants ----------
 VIDEO_SUFFIXES = (".mp4.processing", ".mp4.processed")
 DEFAULT_CHECK_INTERVAL = 2.0
 DEFAULT_STABLE_CHECKS = 3
@@ -68,14 +68,10 @@ FFMPEG_DEFAULT = {
 # ---------- Helpers ----------
 
 def is_processing_file(p: Path) -> bool:
-    """Return True if filename ends with a recognized processing suffix."""
     return any(p.name.lower().endswith(suffix) for suffix in VIDEO_SUFFIXES)
 
 
 def stable_file_wait(path: Path, timeout: int = DEFAULT_TIMEOUT, interval: float = DEFAULT_CHECK_INTERVAL, stable_checks: int = DEFAULT_STABLE_CHECKS) -> bool:
-    """Wait until the file size is stable for `stable_checks` checks or until timeout.
-    Returns True if stable, False if timed out or file missing.
-    """
     start = time.time()
     last_size = -1
     stable = 0
@@ -102,15 +98,12 @@ def stable_file_wait(path: Path, timeout: int = DEFAULT_TIMEOUT, interval: float
 
 
 def unique_name(dst_dir: Path, base_name: str) -> Path:
-    """Return an available unique path in dst_dir using uuid + timestamp prefix.
-    Keeps original suffix.
-    """
     suffix = Path(base_name).suffix
     stem = Path(base_name).stem
     unique = f"{int(time.time())}_{uuid.uuid4().hex}_{stem}{suffix}"
     return dst_dir / unique
 
-# ---------- Video processing ----------
+# ---------- Video processor ----------
 class VideoProcessor:
     def __init__(self, temp_dir: Path, ffmpeg_opts: dict | None = None):
         self.temp_dir = temp_dir
@@ -126,12 +119,10 @@ class VideoProcessor:
             return False
 
     def compress_and_strip(self, src: Path, dst: Path, width: Optional[int] = None, height: Optional[int] = None) -> bool:
-        """Run ffmpeg to strip metadata and compress into dst path. Returns True on success."""
         if not src.exists():
             logger.error("Source missing for compression: %s", src)
             return False
 
-        # Build a vf string only if both width and height provided
         vf = None
         if width and height:
             vf = f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
@@ -140,8 +131,7 @@ class VideoProcessor:
             "ffmpeg",
             "-hide_banner",
             "-y",
-            "-i",
-            str(src),
+            "-i", str(src),
             "-map_metadata", "-1",
             "-map_chapters", "-1",
         ]
@@ -211,12 +201,11 @@ class ProcessingFileHandler(FileSystemEventHandler):
             return
         self._processing.add(key)
         try:
-            # Wait until source file is stable
             if not stable_file_wait(src):
                 logger.error("Source didn't stabilize: %s", src)
                 return
 
-            # Move to temp directory (use shutil.move which handles cross-device)
+            # Move the file to temp and rename it to remove the .processing suffix so ffmpeg can open it
             temp_move = self.temp_dir / src.name
             try:
                 logger.info("Moving to temp: %s -> %s", src, temp_move)
@@ -225,7 +214,7 @@ class ProcessingFileHandler(FileSystemEventHandler):
                 logger.exception("Move to temp failed: %s", exc)
                 return
 
-            # Remove suffix (.processing/.processed) to mp4 name
+            # derive mp4 name and rename in temp
             name = temp_move.name
             mp4_name = name
             for s in VIDEO_SUFFIXES:
@@ -234,13 +223,13 @@ class ProcessingFileHandler(FileSystemEventHandler):
                     break
             temp_mp4 = self.temp_dir / mp4_name
             try:
-                logger.info("Rename in temp: %s -> %s", temp_move.name, temp_mp4.name)
+                logger.info("Renaming in temp: %s -> %s", temp_move.name, temp_mp4.name)
                 temp_move.rename(temp_mp4)
             except Exception:
                 logger.warning("Rename failed, will continue with moved file as-is")
                 temp_mp4 = temp_move
 
-            # Prepare compressed output in temp
+            # Now run compression on the temp_mp4 (without .processing suffix)
             compressed_temp = self.temp_dir / f"compressed_{int(time.time())}_{uuid.uuid4().hex}_{temp_mp4.name}"
             ok = self.processor.compress_and_strip(temp_mp4, compressed_temp)
             if not ok:
@@ -270,7 +259,6 @@ class ProcessingFileHandler(FileSystemEventHandler):
             logger.info("Finished processing %s", final_target)
 
         finally:
-            # Cleanup: remove source temp_mp4 if still exists
             try:
                 if 'temp_mp4' in locals() and temp_mp4.exists():
                     temp_mp4.unlink()
@@ -282,9 +270,9 @@ class ProcessingFileHandler(FileSystemEventHandler):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Fireshare video processing watcher")
-    p.add_argument("--watch-dir", default="~/fireshare/incoming", help="Directory to watch for .mp4.processing files")
-    p.add_argument("--output-dir", default="~/fireshare/videos", help="Directory Fireshare watches (final MP4s go here)")
-    p.add_argument("--temp-dir", default="~/fireshare/temp", help="Temp working directory")
+    p.add_argument("--watch-dir", default="~/fireshare/clips/uploads", help="Directory to watch for .mp4.processing files")
+    p.add_argument("--output-dir", default="~/fireshare/clips/videos", help="Directory Fireshare watches (final MP4s go here)")
+    p.add_argument("--temp-dir", default="~/fireshare/clips/temp", help="Temp working directory")
     p.add_argument("--crf", type=int, default=23, help="CRF for compression (lower = better quality)")
     p.add_argument("--preset", default="medium", help="ffmpeg preset")
     p.add_argument("--audio-bitrate", default="192k")
@@ -312,7 +300,6 @@ def main():
     handler = ProcessingFileHandler(processor=processor, watch_dir=watch_dir, output_dir=output_dir, temp_dir=temp_dir)
 
     if args.once:
-        # Run one pass: process existing files in watch_dir that match
         for p in watch_dir.iterdir():
             if p.is_file() and is_processing_file(p):
                 handler._handle(p)

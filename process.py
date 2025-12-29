@@ -1,33 +1,17 @@
 #!/usr/bin/env python3
 """
-Production-grade Fireshare processing daemon
+Production-grade Fireshare processing daemon with quality presets.
 
 Workflow:
   watch_temp (incoming uploads with .mp4.processing) -> temp processing -> compress -> write final mp4 into Fireshare /videos dir -> run scan
 
-Features:
-- Safe handling of .mp4.processing suffix (rename in temp before ffmpeg)
-- Wait for file size stability to avoid partial uploads
-- Per-file isolated temp working directory to avoid collisions
-- Configurable concurrency (ThreadPoolExecutor)
-- Robust logging with timestamped log file
-- CLI flags for ffmpeg parameters, directories, dry-run, preserve-name
-- Validations (ffmpeg/ffprobe availability, directories, avoiding watch==output)
-- Graceful shutdown (SIGINT/SIGTERM)
-- Runs Docker scan command exactly as requested:
-    docker exec -it fireshare fireshare scan-video --path ~/fireshare/clips/videos/uploads/{filename.mp4}
-
-Dependencies:
-- Python 3.8+
-- watchdog (pip install watchdog)
-- ffmpeg/ffprobe in PATH
-
-Example:
-  ./process_production.py \
-    --watch-dir ~/fireshare/clips/uploads \
-    --temp-dir ~/fireshare/clips/temp \
-    --output-dir ~/fireshare/clips/videos \
-    --concurrency 2
+Key features:
+- Removes .processing suffix in temp before ffmpeg
+- Waits until upload is stable
+- Isolated per-file workdir
+- Threaded concurrent processing
+- --quality and --resolution options
+- Default scan command points to container /videos path (fixes 'invalid video' scan errors)
 """
 
 from __future__ import annotations
@@ -46,7 +30,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 try:
     from watchdog.observers import Observer
@@ -55,7 +39,7 @@ except Exception:
     print("Missing dependency: watchdog. Install with `pip install watchdog`.")
     raise
 
-# ---------- Configurable defaults ----------
+# ---------- Defaults & presets ----------
 DEFAULT_CHECK_INTERVAL = 2.0
 DEFAULT_STABLE_CHECKS = 3
 DEFAULT_TIMEOUT = 300
@@ -63,7 +47,19 @@ DEFAULT_CONCURRENCY = 1
 LOG_DIR = Path("/var/log/fireshare_processor")
 LOG_FILE = LOG_DIR / f"processor_{datetime.utcnow().strftime('%Y%m%d')}.log"
 
-# ---------- Logging setup ----------
+QUALITY_PRESETS = {
+    "low": {"crf": 28, "preset": "fast", "audio_bitrate": "128k"},
+    "medium": {"crf": 23, "preset": "medium", "audio_bitrate": "192k"},
+    "high": {"crf": 20, "preset": "slow", "audio_bitrate": "256k"},
+}
+
+RESOLUTION_MAP = {
+    "1080p": (1920, 1080),
+    "720p": (1280, 720),
+    "auto": None,
+}
+
+# ---------- Logging ----------
 def setup_logging(debug: bool = False):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     level = logging.DEBUG if debug else logging.INFO
@@ -77,24 +73,14 @@ def setup_logging(debug: bool = False):
 
 logger = logging.getLogger("fireshare_processor")
 
-# ---------- Utilities ----------
-
-
+# ---------- Helpers ----------
 def safe_strip_suffix(name: str, suffix: str) -> str:
     if name.lower().endswith(suffix.lower()):
         return name[: -len(suffix)]
     return name
 
 
-def wait_for_stable(
-    path: Path,
-    timeout: int = DEFAULT_TIMEOUT,
-    interval: float = DEFAULT_CHECK_INTERVAL,
-    stable_checks: int = DEFAULT_STABLE_CHECKS,
-) -> bool:
-    """Wait until file size is stable for `stable_checks` checks.
-    Returns True when stable, False on timeout or file disappearance.
-    """
+def wait_for_stable(path: Path, timeout: int = DEFAULT_TIMEOUT, interval: float = DEFAULT_CHECK_INTERVAL, stable_checks: int = DEFAULT_STABLE_CHECKS) -> bool:
     start = time.time()
     last = -1
     stable = 0
@@ -121,9 +107,6 @@ def wait_for_stable(
 
 
 def unique_final_name(output_dir: Path, base_name: str, preserve_name: bool = False) -> Path:
-    """Return a unique final filename. If preserve_name True, attempt to keep original filename and append suffix when conflict.
-    Otherwise return timestamp_uuid_original.mp4
-    """
     base = Path(base_name)
     if preserve_name:
         candidate = output_dir / base.name
@@ -146,24 +129,34 @@ def ensure_ffmpeg_available() -> bool:
         return False
 
 
-# ---------- Worker: single-file processing ----------
+# ---------- File processor ----------
 class FileProcessor:
     def __init__(
         self,
         temp_dir: Path,
         output_dir: Path,
-        ffmpeg_opts: dict,
+        quality: str,
+        resolution: Optional[Tuple[int, int]],
         scan_cmd_template: Optional[str],
         preserve_name: bool,
         dry_run: bool = False,
     ):
         self.temp_dir = temp_dir
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir = output_dir
-        self.ffmpeg_opts = ffmpeg_opts
+        self.quality = quality
+        self.resolution = resolution
         self.scan_cmd_template = scan_cmd_template
         self.preserve_name = preserve_name
         self.dry_run = dry_run
         self._lock = threading.Lock()
+
+        # apply preset
+        preset = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["medium"])
+        self.vcodec = "libx264"
+        self.crf = preset["crf"]
+        self.ff_preset = preset["preset"]
+        self.audio_bitrate = preset["audio_bitrate"]
 
     def _create_workdir(self) -> Path:
         w = self.temp_dir / f"work_{uuid.uuid4().hex}"
@@ -194,24 +187,33 @@ class FileProcessor:
             "-1",
             "-map_chapters",
             "-1",
+        ]
+
+        # add scaling/padding filter if resolution requested
+        if self.resolution:
+            w, h = self.resolution
+            vf = f"scale=w={w}:h={h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
+            cmd += ["-vf", vf]
+
+        cmd += [
             "-c:v",
-            self.ffmpeg_opts.get("vcodec", "libx264"),
+            self.vcodec,
             "-preset",
-            self.ffmpeg_opts.get("preset", "medium"),
+            self.ff_preset,
             "-crf",
-            str(self.ffmpeg_opts.get("crf", 23)),
+            str(self.crf),
             "-pix_fmt",
             "yuv420p",
             "-c:a",
-            self.ffmpeg_opts.get("acodec", "aac"),
+            "aac",
             "-b:a",
-            self.ffmpeg_opts.get("audio_bitrate", "192k"),
+            self.audio_bitrate,
             "-movflags",
             "+faststart",
             str(dst),
         ]
 
-        logger.info("Running ffmpeg: %s -> %s", src.name, dst.name)
+        logger.info("Running ffmpeg: %s -> %s (quality=%s, resolution=%s)", src.name, dst.name, self.quality, ("auto" if not self.resolution else f"{self.resolution[1]}p"))
         if self.dry_run:
             logger.info("dry-run: ffmpeg cmd: %s", " ".join(cmd))
             return True
@@ -227,18 +229,11 @@ class FileProcessor:
         return True
 
     def _run_scan(self, final_path: Path) -> bool:
-        """
-        Run the configured scan command.
-        The default scan_cmd_template expects a {filename} token which will be replaced
-        by final_path.name to construct the container path you requested.
-        Example template:
-          "docker exec -it fireshare fireshare scan-video --path ~/fireshare/clips/videos/uploads/{filename}"
-        """
         if not self.scan_cmd_template:
             logger.debug("No scan command configured; skipping scan for %s", final_path)
             return True
 
-        # Replace {filename} with just the filename portion
+        # default template should include /videos/{filename} — we substitute filename only
         cmd_str = self.scan_cmd_template.format(filename=final_path.name)
         cmd = shlex.split(cmd_str)
 
@@ -249,34 +244,21 @@ class FileProcessor:
 
         try:
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            logger.info(
-                "scan exit=%s stdout=%s stderr=%s",
-                res.returncode,
-                (res.stdout or "").strip(),
-                (res.stderr or "").strip(),
-            )
+            logger.info("scan exit=%s stdout=%s stderr=%s", res.returncode, (res.stdout or "").strip(), (res.stderr or "").strip())
             return res.returncode == 0
         except Exception as exc:
             logger.warning("Scan command failed: %s", exc)
             return False
 
     def process(self, src_path: Path) -> bool:
-        """Process a single .mp4.processing file end-to-end.
-        Returns True on success.
-        """
         logger.info("Starting processing: %s", src_path)
-
-        # Wait until stable
         if not wait_for_stable(src_path):
             logger.error("File not stable: %s", src_path)
             return False
 
-        # Create isolated workdir
         workdir: Optional[Path] = None
         try:
             workdir = self._create_workdir()
-
-            # Move file to workdir (still with original name)
             temp_raw = workdir / src_path.name
             try:
                 shutil.move(str(src_path), str(temp_raw))
@@ -284,7 +266,7 @@ class FileProcessor:
                 logger.exception("Failed to move to workdir: %s", exc)
                 return False
 
-            # Strip .processing / .processed suffix to target_mp4 name
+            # strip .processing/.processed
             clean_name = safe_strip_suffix(temp_raw.name, ".processing")
             clean_name = safe_strip_suffix(clean_name, ".processed")
             if not clean_name.lower().endswith(".mp4"):
@@ -292,21 +274,14 @@ class FileProcessor:
                 return False
 
             temp_mp4 = workdir / clean_name
-            # Rename raw->mp4 (atomic within same fs)
             temp_raw.rename(temp_mp4)
 
-            # Prepare compressed temp output name (guaranteed .mp4)
             compressed_temp = workdir / "compressed_output.mp4"
-
-            # Run ffmpeg (compress + strip metadata)
             if not self._run_ffmpeg(temp_mp4, compressed_temp):
                 logger.error("Compression failed for %s", temp_mp4)
                 return False
 
-            # Determine final name in output_dir
             final = unique_final_name(self.output_dir, temp_mp4.name, preserve_name=self.preserve_name)
-
-            # Move compressed into final location (atomic move when possible)
             try:
                 shutil.move(str(compressed_temp), str(final))
             except Exception as exc:
@@ -315,21 +290,19 @@ class FileProcessor:
 
             logger.info("Moved final video to: %s", final)
 
-            # Run scan command (if configured)
             scan_ok = self._run_scan(final)
             if not scan_ok:
                 logger.warning("Scan reported failure for %s", final)
 
             return True
-
         finally:
             if workdir:
                 self._cleanup_workdir(workdir)
 
 
-# ---------- Watcher / Coordinator ----------
+# ---------- Watcher ----------
 class IncomingWatcher(FileSystemEventHandler):
-    def __init__(self, processor: FileProcessor, watch_dir: Path, executor: ThreadPoolExecutor, seen_delay: float = 0.1):
+    def __init__(self, processor: FileProcessor, watch_dir: Path, executor: ThreadPoolExecutor):
         self.processor = processor
         self.watch_dir = watch_dir
         self.executor = executor
@@ -347,7 +320,6 @@ class IncomingWatcher(FileSystemEventHandler):
         self._maybe_submit(Path(event.dest_path))
 
     def _maybe_submit(self, path: Path):
-        # Accept only .mp4.processing or .mp4.processed
         if not (path.name.lower().endswith(".mp4.processing") or path.name.lower().endswith(".mp4.processed")):
             return
         key = str(path.resolve())
@@ -357,7 +329,6 @@ class IncomingWatcher(FileSystemEventHandler):
                 return
             self._processing.add(key)
         logger.info("Queueing file for processing: %s", path)
-        # submit to executor
         fut = self.executor.submit(self._run_task, path)
         fut.add_done_callback(lambda f, k=key: self._done_callback(k, f))
 
@@ -376,7 +347,7 @@ class IncomingWatcher(FileSystemEventHandler):
                 pass
 
 
-# ---------- Graceful shutdown ----------
+# ---------- Shutdown ----------
 shutdown_event = threading.Event()
 
 
@@ -402,18 +373,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Production Fireshare processing daemon")
     p.add_argument("--watch-dir", default="~/fireshare/clips/uploads", help="Directory to watch for incoming .mp4.processing files")
     p.add_argument("--temp-dir", default="~/fireshare/clips/temp", help="Temporary working directory")
-    p.add_argument("--output-dir", default="~/fireshare/clips/videos", help="Fireshare watched output directory (mounted to /videos in container)")
+    p.add_argument("--output-dir", default="~/fireshare/clips/videos", help="Fireshare watched output directory (host path mounted to /videos in container)")
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY, help="Number of concurrent processing workers")
-    p.add_argument("--crf", type=int, default=23, help="ffmpeg CRF (lower better quality)")
-    p.add_argument("--preset", default="medium", help="ffmpeg preset")
-    p.add_argument("--audio-bitrate", default="192k", help="audio bitrate for ffmpeg")
-    # Default template uses {filename} which will be substituted with final_path.name
-    p.add_argument(
-        "--scan-cmd",
-        default="docker exec -it fireshare fireshare scan-video --path ~/fireshare/clips/videos/uploads/{filename}",
-        help="Command template to run after moving final file. Use {filename} to interpolate the MP4 filename inside the container path.",
-    )
-    p.add_argument("--preserve-name", action="store_true", help="Attempt to preserve original filename in output directory (appends suffix on conflict)")
+    p.add_argument("--quality", choices=["low", "medium", "high"], default="medium", help="Quality preset (affects CRF/preset/audio)")
+    p.add_argument("--resolution", choices=["1080p", "720p", "auto"], default="1080p", help="Target resolution (scale+pad). 'auto' leaves original resolution")
+    p.add_argument("--preserve-name", action="store_true", help="Attempt to preserve original filename in output directory (append suffix on conflict)")
+    p.add_argument("--scan-cmd", default="docker exec fireshare fireshare scan-video --path /videos/{filename}", help="Command template to run after moving final file. Use {filename} to interpolate the MP4 filename inside the container path.")
     p.add_argument("--dry-run", action="store_true", help="Do everything except actually run ffmpeg/move files (useful for testing)")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
     return p
@@ -438,12 +403,12 @@ def main():
         logger.error("ffmpeg/ffprobe not found in PATH. Install ffmpeg or run with --dry-run for testing.")
         sys.exit(3)
 
-    ffmpeg_opts = {"vcodec": "libx264", "crf": args.crf, "preset": args.preset, "audio_bitrate": args.audio_bitrate}
-
+    resolution = RESOLUTION_MAP.get(args.resolution)
     processor = FileProcessor(
         temp_dir=temp_dir,
         output_dir=output_dir,
-        ffmpeg_opts=ffmpeg_opts,
+        quality=args.quality,
+        resolution=resolution,
         scan_cmd_template=args.scan_cmd,
         preserve_name=args.preserve_name,
         dry_run=args.dry_run,
@@ -458,7 +423,7 @@ def main():
 
     install_signal_handlers(observer, executor)
 
-    logger.info("Started processor. Watching %s -> output %s (temp %s). concurrency=%d", watch_dir, output_dir, temp_dir, args.concurrency)
+    logger.info("Started processor. Watching %s -> output %s (temp %s). concurrency=%d quality=%s resolution=%s", watch_dir, output_dir, temp_dir, args.concurrency, args.quality, args.resolution)
 
     try:
         while not shutdown_event.is_set():

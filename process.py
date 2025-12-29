@@ -429,7 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--quality", choices=["low", "medium", "high"], default="medium", help="Quality preset (affects CRF/preset/audio)")
     p.add_argument("--resolution", choices=["1080p", "720p", "auto"], default="1080p", help="Target resolution (scale+pad). 'auto' leaves original resolution")
     p.add_argument("--preserve-name", action="store_true", help="Attempt to preserve original filename in output directory (append suffix on conflict)")
-    p.add_argument("--scan-cmd", default="docker exec fireshare fireshare scan-video --path /videos/{filename}", help="Command template to run after moving final file. Use {filename} to interpolate the MP4 filename inside the container path. The scan-video command auto-generates posters.")
+    p.add_argument("--scan-cmd", default="docker exec fireshare fireshare scan-video --path /videos/{filename} --regenerate-poster", help="Command template to run after moving final file. Use {filename} to interpolate the MP4 filename inside the container path. The scan-video command with --regenerate-poster flag will generate poster images.")
     p.add_argument("--scan-delay", type=float, default=2.0, help="Seconds to wait after moving file before scanning (helps container see new file)")
     p.add_argument("--dry-run", action="store_true", help="Do everything except actually run ffmpeg/move files (useful for testing)")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")

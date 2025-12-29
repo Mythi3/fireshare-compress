@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-Production-grade Fireshare processing daemon with quality presets.
+Production-grade Fireshare processor with quality presets and robust Docker scan.
 
-Workflow:
-  watch_temp (incoming uploads with .mp4.processing) -> temp processing -> compress -> write final mp4 into Fireshare /videos dir -> run scan
-
-Key features:
-- Removes .processing suffix in temp before ffmpeg
-- Waits until upload is stable
-- Isolated per-file workdir
-- Threaded concurrent processing
-- --quality and --resolution options
-- Default scan command points to container /videos path (fixes 'invalid video' scan errors)
+Key behavior:
+ - watch incoming .mp4.processing files
+ - wait until stable, move to per-file workdir, rename to remove .processing
+ - compress/strip metadata with ffmpeg (CRF presets)
+ - move final .mp4 into output dir (Fireshare /videos mount)
+ - run Docker scan command with safe filename substitution and retry/backoff
 """
 
 from __future__ import annotations
@@ -58,6 +54,8 @@ RESOLUTION_MAP = {
     "720p": (1280, 720),
     "auto": None,
 }
+
+VIDEO_SUFFIXES = (".mp4.processing", ".mp4.processed")
 
 # ---------- Logging ----------
 def setup_logging(debug: bool = False):
@@ -129,6 +127,10 @@ def ensure_ffmpeg_available() -> bool:
         return False
 
 
+def is_processing_file(p: Path) -> bool:
+    return any(p.name.lower().endswith(s) for s in VIDEO_SUFFIXES)
+
+
 # ---------- File processor ----------
 class FileProcessor:
     def __init__(
@@ -151,7 +153,6 @@ class FileProcessor:
         self.dry_run = dry_run
         self._lock = threading.Lock()
 
-        # apply preset
         preset = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["medium"])
         self.vcodec = "libx264"
         self.crf = preset["crf"]
@@ -189,7 +190,6 @@ class FileProcessor:
             "-1",
         ]
 
-        # add scaling/padding filter if resolution requested
         if self.resolution:
             w, h = self.resolution
             vf = f"scale=w={w}:h={h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
@@ -228,13 +228,18 @@ class FileProcessor:
         logger.info("ffmpeg success: %s -> %s", src.name, dst.name)
         return True
 
-    def _run_scan(self, final_path: Path) -> bool:
+    def _run_scan(self, final_path: Path, max_retries: int = 3, initial_backoff: float = 1.0) -> bool:
+        """
+        Run the configured scan command safely. Template must use {filename} placeholder.
+        This uses simple string replacement (no .format) to avoid KeyError/NameError issues.
+        Retries on non-zero exit with exponential backoff.
+        """
         if not self.scan_cmd_template:
             logger.debug("No scan command configured; skipping scan for %s", final_path)
             return True
 
-        # default template should include /videos/{filename} — we substitute filename only
-        cmd_str = self.scan_cmd_template.format(filename=final_path.name)
+        # Safe substitution: only replace the {filename} token. This avoids template-format errors.
+        cmd_str = self.scan_cmd_template.replace("{filename}", final_path.name)
         cmd = shlex.split(cmd_str)
 
         logger.info("Running scan command: %s", cmd_str)
@@ -242,13 +247,24 @@ class FileProcessor:
             logger.info("dry-run: scan cmd: %s", cmd_str)
             return True
 
-        try:
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            logger.info("scan exit=%s stdout=%s stderr=%s", res.returncode, (res.stdout or "").strip(), (res.stderr or "").strip())
-            return res.returncode == 0
-        except Exception as exc:
-            logger.warning("Scan command failed: %s", exc)
-            return False
+        backoff = initial_backoff
+        for attempt in range(1, max_retries + 1):
+            try:
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                logger.info("scan attempt=%d exit=%s stdout=%s stderr=%s", attempt, res.returncode, (res.stdout or "").strip(), (res.stderr or "").strip())
+                if res.returncode == 0:
+                    return True
+                else:
+                    logger.warning("Scan returned non-zero (attempt %d). backoff=%.1f", attempt, backoff)
+            except Exception as exc:
+                logger.warning("Scan execution failed on attempt %d: %s", attempt, exc)
+
+            if attempt < max_retries:
+                time.sleep(backoff)
+                backoff *= 2.0
+
+        logger.error("Scan failed after %d attempts for %s", max_retries, final_path)
+        return False
 
     def process(self, src_path: Path) -> bool:
         logger.info("Starting processing: %s", src_path)
@@ -266,7 +282,6 @@ class FileProcessor:
                 logger.exception("Failed to move to workdir: %s", exc)
                 return False
 
-            # strip .processing/.processed
             clean_name = safe_strip_suffix(temp_raw.name, ".processing")
             clean_name = safe_strip_suffix(clean_name, ".processed")
             if not clean_name.lower().endswith(".mp4"):
@@ -290,6 +305,7 @@ class FileProcessor:
 
             logger.info("Moved final video to: %s", final)
 
+            # Run container scan (with retries/backoff)
             scan_ok = self._run_scan(final)
             if not scan_ok:
                 logger.warning("Scan reported failure for %s", final)
@@ -320,7 +336,7 @@ class IncomingWatcher(FileSystemEventHandler):
         self._maybe_submit(Path(event.dest_path))
 
     def _maybe_submit(self, path: Path):
-        if not (path.name.lower().endswith(".mp4.processing") or path.name.lower().endswith(".mp4.processed")):
+        if not is_processing_file(path):
             return
         key = str(path.resolve())
         with self._lock:

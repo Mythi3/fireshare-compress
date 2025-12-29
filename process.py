@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
-Production-grade Fireshare processor with quality presets and robust Docker scan.
+Production-grade Fireshare processing daemon
 
-Key behavior:
- - watch incoming .mp4.processing files
- - wait until stable, move to per-file workdir, rename to remove .processing
- - compress/strip metadata with ffmpeg (CRF presets)
- - move final .mp4 into output dir (Fireshare /videos mount)
- - run Docker scan command with safe filename substitution and retry/backoff
+Workflow:
+  watch_temp (incoming uploads with .mp4.processing) -> per-file temp workdir -> compress -> write final mp4 into Fireshare /videos dir -> run docker scan (with retries/backoff)
+
+Features:
+- Safe handling of .mp4.processing suffix (rename in per-file temp before ffmpeg)
+- Wait for file size stability to avoid partial uploads
+- Per-file isolated temp working directory to avoid collisions
+- Configurable concurrency (ThreadPoolExecutor)
+- Robust logging with timestamped log file
+- CLI flags for quality presets and resolution
+- Validations (ffmpeg/ffprobe availability, directories, avoiding watch==output)
+- Graceful shutdown (SIGINT/SIGTERM)
+- Preserves original uploaded filename in Fireshare /videos by default
 """
 
 from __future__ import annotations
@@ -71,6 +78,7 @@ def setup_logging(debug: bool = False):
 
 logger = logging.getLogger("fireshare_processor")
 
+
 # ---------- Helpers ----------
 def safe_strip_suffix(name: str, suffix: str) -> str:
     if name.lower().endswith(suffix.lower()):
@@ -78,7 +86,13 @@ def safe_strip_suffix(name: str, suffix: str) -> str:
     return name
 
 
-def wait_for_stable(path: Path, timeout: int = DEFAULT_TIMEOUT, interval: float = DEFAULT_CHECK_INTERVAL, stable_checks: int = DEFAULT_STABLE_CHECKS) -> bool:
+def wait_for_stable(
+    path: Path,
+    timeout: int = DEFAULT_TIMEOUT,
+    interval: float = DEFAULT_CHECK_INTERVAL,
+    stable_checks: int = DEFAULT_STABLE_CHECKS,
+) -> bool:
+    """Wait until file size is stable for `stable_checks` checks."""
     start = time.time()
     last = -1
     stable = 0
@@ -104,7 +118,11 @@ def wait_for_stable(path: Path, timeout: int = DEFAULT_TIMEOUT, interval: float 
     return False
 
 
-def unique_final_name(output_dir: Path, base_name: str, preserve_name: bool = False) -> Path:
+def unique_final_name(output_dir: Path, base_name: str, preserve_name: bool = True) -> Path:
+    """
+    If preserve_name True, attempt to place output as base_name and append _1/_2 on collisions.
+    Otherwise, use timestamp_uuid_base_name.
+    """
     base = Path(base_name)
     if preserve_name:
         candidate = output_dir / base.name
@@ -231,15 +249,16 @@ class FileProcessor:
     def _run_scan(self, final_path: Path, max_retries: int = 3, initial_backoff: float = 1.0) -> bool:
         """
         Run the configured scan command safely. Template must use {filename} placeholder.
-        This uses simple string replacement (no .format) to avoid KeyError/NameError issues.
+        Uses simple replace() to avoid format() KeyError/NameError.
         Retries on non-zero exit with exponential backoff.
         """
         if not self.scan_cmd_template:
             logger.debug("No scan command configured; skipping scan for %s", final_path)
             return True
 
-        # Safe substitution: only replace the {filename} token. This avoids template-format errors.
-        cmd_str = self.scan_cmd_template.replace("{filename}", final_path.name)
+        # Safe substitution: replace literal {filename} token
+        final_name = final_path.name
+        cmd_str = self.scan_cmd_template.replace("{filename}", final_name)
         cmd = shlex.split(cmd_str)
 
         logger.info("Running scan command: %s", cmd_str)
@@ -275,6 +294,7 @@ class FileProcessor:
         workdir: Optional[Path] = None
         try:
             workdir = self._create_workdir()
+            # move file into per-file workdir
             temp_raw = workdir / src_path.name
             try:
                 shutil.move(str(src_path), str(temp_raw))
@@ -282,6 +302,7 @@ class FileProcessor:
                 logger.exception("Failed to move to workdir: %s", exc)
                 return False
 
+            # strip processing suffixes
             clean_name = safe_strip_suffix(temp_raw.name, ".processing")
             clean_name = safe_strip_suffix(clean_name, ".processed")
             if not clean_name.lower().endswith(".mp4"):
@@ -291,11 +312,13 @@ class FileProcessor:
             temp_mp4 = workdir / clean_name
             temp_raw.rename(temp_mp4)
 
+            # compress
             compressed_temp = workdir / "compressed_output.mp4"
             if not self._run_ffmpeg(temp_mp4, compressed_temp):
                 logger.error("Compression failed for %s", temp_mp4)
                 return False
 
+            # Move compressed into final location, attempting to preserve original filename if requested
             final = unique_final_name(self.output_dir, temp_mp4.name, preserve_name=self.preserve_name)
             try:
                 shutil.move(str(compressed_temp), str(final))
@@ -304,6 +327,12 @@ class FileProcessor:
                 return False
 
             logger.info("Moved final video to: %s", final)
+
+            # If preservation is requested but final ended up unique (e.g., a collision), ensure we still
+            # restore the original uploaded filename where possible (we already computed final above to
+            # avoid name collisions). This behavior makes the filename in /videos equal to the original upload name,
+            # or a unique incremented variant when a name collision already exists.
+            # (unique_final_name already implements the collision handling.)
 
             # Run container scan (with retries/backoff)
             scan_ok = self._run_scan(final)
@@ -393,8 +422,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY, help="Number of concurrent processing workers")
     p.add_argument("--quality", choices=["low", "medium", "high"], default="medium", help="Quality preset (affects CRF/preset/audio)")
     p.add_argument("--resolution", choices=["1080p", "720p", "auto"], default="1080p", help="Target resolution (scale+pad). 'auto' leaves original resolution")
-    p.add_argument("--preserve-name", action="store_true", help="Attempt to preserve original filename in output directory (append suffix on conflict)")
-    p.add_argument("--scan-cmd", default="docker exec fireshare fireshare scan-video --path /videos/{filename}", help="Command template to run after moving final file. Use {filename} to interpolate the MP4 filename inside the container path.")
+    p.add_argument("--preserve-name", action="store_true", default=True, help="Attempt to preserve original filename in output directory (append suffix on conflict). Default: on")
+    p.add_argument("--no-preserve-name", action="store_true", help="Disable preserve-name behavior (use unique timestamped names instead)")
+    p.add_argument("--scan-cmd", default="docker exec fireshare fireshare scan-video --path /videos/{filename}", help="Command template to run after moving final file. Use {filename} to interpolate filename inside container path.")
     p.add_argument("--dry-run", action="store_true", help="Do everything except actually run ffmpeg/move files (useful for testing)")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
     return p
@@ -420,13 +450,15 @@ def main():
         sys.exit(3)
 
     resolution = RESOLUTION_MAP.get(args.resolution)
+    preserve_name = args.preserve_name and not args.no_preserve_name
+
     processor = FileProcessor(
         temp_dir=temp_dir,
         output_dir=output_dir,
         quality=args.quality,
         resolution=resolution,
         scan_cmd_template=args.scan_cmd,
-        preserve_name=args.preserve_name,
+        preserve_name=preserve_name,
         dry_run=args.dry_run,
     )
 
@@ -439,7 +471,16 @@ def main():
 
     install_signal_handlers(observer, executor)
 
-    logger.info("Started processor. Watching %s -> output %s (temp %s). concurrency=%d quality=%s resolution=%s", watch_dir, output_dir, temp_dir, args.concurrency, args.quality, args.resolution)
+    logger.info(
+        "Started processor. Watching %s -> output %s (temp %s). concurrency=%d quality=%s resolution=%s preserve_name=%s",
+        watch_dir,
+        output_dir,
+        temp_dir,
+        args.concurrency,
+        args.quality,
+        args.resolution,
+        preserve_name,
+    )
 
     try:
         while not shutdown_event.is_set():

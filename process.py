@@ -391,21 +391,21 @@ Examples:
     parser.add_argument(
         '--watch-dir',
         type=str,
-        default='~/fireshare/uploads',
+        default='~/fireshare/clips/uploads',
         help='Directory to monitor for .processing files (default: ~/fireshare/uploads)'
     )
     
     parser.add_argument(
         '--output-dir',
         type=str,
-        default='~/fireshare/uploads',
+        default='~/fireshare/clips/uploads',
         help='Directory to output processed files (default: same as watch-dir)'
     )
     
     parser.add_argument(
         '--temp-dir',
         type=str,
-        default='~/fireshare/temp',
+        default='~/fireshare/clips/temp',
         help='Temporary directory for processing (default: ~/fireshare/temp)'
     )
     

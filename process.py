@@ -198,12 +198,11 @@ class FileProcessor:
         logger.info("ffmpeg success: %s -> %s", src.name, dst.name)
         return True
 
-    def _run_scan(self, final_path: Path) -> bool:
+        def _run_scan(self, final_path: Path) -> bool:
         if not self.scan_cmd_template:
             logger.debug("No scan command configured; skipping scan for %s", final_path)
             return True
         cmd_str = self.scan_cmd_template.format(path=str(final_path))
-        # split safely
         import shlex
         cmd = shlex.split(cmd_str)
         logger.info("Running scan command: %s", cmd_str)
@@ -361,7 +360,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--crf", type=int, default=23, help="ffmpeg CRF (lower better quality)")
     p.add_argument("--preset", default="medium", help="ffmpeg preset")
     p.add_argument("--audio-bitrate", default="192k", help="audio bitrate for ffmpeg")
-    p.add_argument("--scan-cmd", default="fireshare scan-video --path {path}", help="Command template to run after moving final file. Use {path} to interpolate the file path.")
+    p.add_argument("--scan-cmd", default="docker exec fireshare fireshare scan-video --path {path}", help="Command template to run after moving final file. Use {path} to interpolate the file path.")
     p.add_argument("--preserve-name", action="store_true", help="Attempt to preserve original filename in output directory (appends suffix on conflict)")
     p.add_argument("--dry-run", action="store_true", help="Do everything except actually run ffmpeg/move files (useful for testing)")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")

@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Production-grade Fireshare processor with quality presets, robust Docker scan,
-and automatic poster (thumbnail) generation for each video.
+Production-grade Fireshare processor with quality presets and robust Docker scan.
+
+Key behavior:
+ - watch incoming .mp4.processing files
+ - wait until stable, move to per-file workdir, rename to remove .processing
+ - compress/strip metadata with ffmpeg (CRF presets)
+ - move final .mp4 into output dir (Fireshare /videos mount)
+ - run Docker scan command with safe filename substitution and retry/backoff
 """
 
 from __future__ import annotations
@@ -72,12 +78,7 @@ def safe_strip_suffix(name: str, suffix: str) -> str:
     return name
 
 
-def wait_for_stable(
-    path: Path,
-    timeout: int = DEFAULT_TIMEOUT,
-    interval: float = DEFAULT_CHECK_INTERVAL,
-    stable_checks: int = DEFAULT_STABLE_CHECKS,
-) -> bool:
+def wait_for_stable(path: Path, timeout: int = DEFAULT_TIMEOUT, interval: float = DEFAULT_CHECK_INTERVAL, stable_checks: int = DEFAULT_STABLE_CHECKS) -> bool:
     start = time.time()
     last = -1
     stable = 0
@@ -103,7 +104,7 @@ def wait_for_stable(
     return False
 
 
-def unique_final_name(output_dir: Path, base_name: str, preserve_name: bool = True) -> Path:
+def unique_final_name(output_dir: Path, base_name: str, preserve_name: bool = False) -> Path:
     base = Path(base_name)
     if preserve_name:
         candidate = output_dir / base.name
@@ -150,6 +151,7 @@ class FileProcessor:
         self.scan_cmd_template = scan_cmd_template
         self.preserve_name = preserve_name
         self.dry_run = dry_run
+        self._lock = threading.Lock()
 
         preset = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["medium"])
         self.vcodec = "libx264"
@@ -223,46 +225,20 @@ class FileProcessor:
         if not dst.exists() or dst.stat().st_size == 0:
             logger.error("ffmpeg produced invalid output for %s", src.name)
             return False
-        return True
-
-    def _generate_poster(self, final_mp4: Path, poster_png: Path, time_position: float = 3.0) -> bool:
-        """
-        Use ffmpeg to extract a poster image at `time_position` seconds.
-        """
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-y",
-            "-i",
-            str(final_mp4),
-            "-ss",
-            str(time_position),
-            "-vframes",
-            "1",
-            "-vf",
-            "scale=320:-1",
-            str(poster_png),
-        ]
-
-        logger.info("Generating poster: %s", poster_png.name)
-        if self.dry_run:
-            logger.info("dry-run: poster cmd: %s", " ".join(cmd))
-            return True
-
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if proc.returncode != 0:
-            logger.error("poster generation failed for %s: %s", final_mp4.name, proc.stderr[-500:])
-            return False
-        if not poster_png.exists() or poster_png.stat().st_size == 0:
-            logger.error("poster file missing: %s", poster_png)
-            return False
+        logger.info("ffmpeg success: %s -> %s", src.name, dst.name)
         return True
 
     def _run_scan(self, final_path: Path, max_retries: int = 3, initial_backoff: float = 1.0) -> bool:
+        """
+        Run the configured scan command safely. Template must use {filename} placeholder.
+        This uses simple string replacement (no .format) to avoid KeyError/NameError issues.
+        Retries on non-zero exit with exponential backoff.
+        """
         if not self.scan_cmd_template:
             logger.debug("No scan command configured; skipping scan for %s", final_path)
             return True
 
+        # Safe substitution: only replace the {filename} token. This avoids template-format errors.
         cmd_str = self.scan_cmd_template.replace("{filename}", final_path.name)
         cmd = shlex.split(cmd_str)
 
@@ -278,6 +254,8 @@ class FileProcessor:
                 logger.info("scan attempt=%d exit=%s stdout=%s stderr=%s", attempt, res.returncode, (res.stdout or "").strip(), (res.stderr or "").strip())
                 if res.returncode == 0:
                     return True
+                else:
+                    logger.warning("Scan returned non-zero (attempt %d). backoff=%.1f", attempt, backoff)
             except Exception as exc:
                 logger.warning("Scan execution failed on attempt %d: %s", attempt, exc)
 
@@ -327,11 +305,7 @@ class FileProcessor:
 
             logger.info("Moved final video to: %s", final)
 
-            # Generate poster alongside the final video
-            poster_file = final.with_suffix(".poster.png")
-            self._generate_poster(final, poster_file)
-
-            # Run container scan
+            # Run container scan (with retries/backoff)
             scan_ok = self._run_scan(final)
             if not scan_ok:
                 logger.warning("Scan reported failure for %s", final)
@@ -341,7 +315,8 @@ class FileProcessor:
             if workdir:
                 self._cleanup_workdir(workdir)
 
-# ---------- Watcher / Coordinator ----------
+
+# ---------- Watcher ----------
 class IncomingWatcher(FileSystemEventHandler):
     def __init__(self, processor: FileProcessor, watch_dir: Path, executor: ThreadPoolExecutor):
         self.processor = processor
@@ -387,8 +362,10 @@ class IncomingWatcher(FileSystemEventHandler):
             except Exception:
                 pass
 
-# ---------- Graceful shutdown ----------
+
+# ---------- Shutdown ----------
 shutdown_event = threading.Event()
+
 
 def install_signal_handlers(observer: Observer, executor: ThreadPoolExecutor):
     def _signal(signum, frame):
@@ -406,52 +383,51 @@ def install_signal_handlers(observer: Observer, executor: ThreadPoolExecutor):
     signal.signal(signal.SIGINT, _signal)
     signal.signal(signal.SIGTERM, _signal)
 
+
 # ---------- CLI / main ----------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Production Fireshare processing daemon")
     p.add_argument("--watch-dir", default="~/fireshare/clips/uploads", help="Directory to watch for incoming .mp4.processing files")
     p.add_argument("--temp-dir", default="~/fireshare/clips/temp", help="Temporary working directory")
     p.add_argument("--output-dir", default="~/fireshare/clips/videos", help="Fireshare watched output directory (host path mounted to /videos in container)")
-    p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY, help="Number of workers")
-    p.add_argument("--quality", choices=["low", "medium", "high"], default="medium", help="Quality preset")
-    p.add_argument("--resolution", choices=["1080p", "720p", "auto"], default="1080p")
-    p.add_argument("--preserve-name", action="store_true", default=True)
-    p.add_argument("--no-preserve-name", action="store_true")
-    p.add_argument("--scan-cmd", default="docker exec fireshare fireshare scan-video --path /videos/{filename}", help="Scan command template")
-    p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--debug", action="store_true")
+    p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY, help="Number of concurrent processing workers")
+    p.add_argument("--quality", choices=["low", "medium", "high"], default="medium", help="Quality preset (affects CRF/preset/audio)")
+    p.add_argument("--resolution", choices=["1080p", "720p", "auto"], default="1080p", help="Target resolution (scale+pad). 'auto' leaves original resolution")
+    p.add_argument("--preserve-name", action="store_true", help="Attempt to preserve original filename in output directory (append suffix on conflict)")
+    p.add_argument("--scan-cmd", default="docker exec fireshare fireshare scan-video --path /videos/{filename}", help="Command template to run after moving final file. Use {filename} to interpolate the MP4 filename inside the container path.")
+    p.add_argument("--dry-run", action="store_true", help="Do everything except actually run ffmpeg/move files (useful for testing)")
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
     return p
+
 
 def main():
     args = build_parser().parse_args()
     setup_logging(debug=args.debug)
 
-    watch_dir = Path(os.path.expanduser(args.watch-dir)).resolve()
-    temp_dir = Path(os.path.expanduser(args.temp-dir)).resolve()
-    output_dir = Path(os.path.expanduser(args.output-dir)).resolve()
+    watch_dir = Path(os.path.expanduser(args.watch_dir)).resolve()
+    temp_dir = Path(os.path.expanduser(args.temp_dir)).resolve()
+    output_dir = Path(os.path.expanduser(args.output_dir)).resolve()
 
     for d in (watch_dir, temp_dir, output_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     if watch_dir == output_dir:
-        logger.error("watch-dir and output-dir must differ")
+        logger.error("watch-dir and output-dir must be different to ensure Fireshare treats files as new. Exiting.")
         sys.exit(2)
 
-    if not ensure_ffmpeg_available() and not args.dry-run:
-        logger.error("ffmpeg/ffprobe not available")
+    if not ensure_ffmpeg_available() and not args.dry_run:
+        logger.error("ffmpeg/ffprobe not found in PATH. Install ffmpeg or run with --dry-run for testing.")
         sys.exit(3)
 
     resolution = RESOLUTION_MAP.get(args.resolution)
-    preserve = args.preserve-name and not args.no-preserve-name
-
     processor = FileProcessor(
         temp_dir=temp_dir,
         output_dir=output_dir,
         quality=args.quality,
         resolution=resolution,
-        scan_cmd_template=args.scan-cmd,
-        preserve_name=preserve,
-        dry_run=args.dry-run,
+        scan_cmd_template=args.scan_cmd,
+        preserve_name=args.preserve_name,
+        dry_run=args.dry_run,
     )
 
     executor = ThreadPoolExecutor(max_workers=max(1, args.concurrency))
@@ -461,18 +437,26 @@ def main():
     observer.schedule(watcher, str(watch_dir), recursive=False)
     observer.start()
 
-    install_signal_handlers(observer, executor) 
+    install_signal_handlers(observer, executor)
 
-    logger.info("Started processor: watch %s -> output %s (temp %s)", watch_dir, output_dir, temp_dir)
+    logger.info("Started processor. Watching %s -> output %s (temp %s). concurrency=%d quality=%s resolution=%s", watch_dir, output_dir, temp_dir, args.concurrency, args.quality, args.resolution)
 
     try:
         while not shutdown_event.is_set():
             time.sleep(1)
     finally:
-        observer.stop()
-        observer.join(timeout=5)
-        executor.shutdown(wait=True)
+        logger.info("Shutting down observer and executor...")
+        try:
+            observer.stop()
+            observer.join(timeout=5)
+        except Exception:
+            pass
+        try:
+            executor.shutdown(wait=True)
+        except Exception:
+            pass
         logger.info("Shutdown complete")
+
 
 if __name__ == "__main__":
     main()

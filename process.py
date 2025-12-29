@@ -86,7 +86,7 @@ class VideoProcessor:
     def __init__(self, quality='medium', resolution='1080p', temp_dir=None):
         self.quality = quality
         self.resolution = resolution
-        self.temp_dir = Path(temp_dir or os.path.expanduser('~/firewatch/temp'))
+        self.temp_dir = Path(temp_dir or os.path.expanduser('~/fireshare/temp'))
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         
         if quality not in QUALITY_PRESETS:
@@ -118,31 +118,16 @@ class VideoProcessor:
             logger.error(f"Failed to get video info: {e}")
             return None
     
-    def strip_metadata(self, input_path, output_path):
-        """Strip all metadata from video"""
+    def compress_video_with_metadata_strip(self, input_path, output_path):
+        """Compress video and strip metadata in a single pass"""
         try:
+            # Build ffmpeg command - strip metadata during compression
             cmd = [
                 'ffmpeg',
                 '-i', str(input_path),
-                '-map_metadata', '-1',
-                '-c', 'copy',
-                '-y',
-                str(output_path)
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            logger.info(f"Metadata stripped: {output_path.name}")
-            return True
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to strip metadata: {e.stderr}")
-            return False
-    
-    def compress_video(self, input_path, output_path):
-        """Compress video with specified quality settings"""
-        try:
-            # Build ffmpeg command
-            cmd = [
-                'ffmpeg',
-                '-i', str(input_path),
+                '-map_metadata', '-1',  # Strip all metadata
+                '-map_chapters', '-1',   # Strip chapters
+                '-fflags', '+bitexact',  # Remove metadata timestamps
                 '-vf', f"scale={self.preset['resolution']}:force_original_aspect_ratio=decrease,pad={self.preset['resolution']}:(ow-iw)/2:(oh-ih)/2",
                 '-c:v', 'libx264',
                 '-preset', self.preset['preset'],
@@ -158,7 +143,7 @@ class VideoProcessor:
                 str(output_path)
             ]
             
-            logger.info(f"Starting compression: {input_path.name}")
+            logger.info(f"Starting compression with metadata stripping: {input_path.name}")
             logger.info(f"Quality: {self.quality}, Resolution: {self.resolution}")
             
             # Run compression with progress logging
@@ -201,7 +186,7 @@ class VideoProcessor:
             return False
     
     def process_video(self, input_path, output_path):
-        """Full processing pipeline: strip metadata and compress"""
+        """Full processing pipeline: strip metadata and compress in one pass"""
         try:
             input_path = Path(input_path)
             output_path = Path(output_path)
@@ -210,26 +195,12 @@ class VideoProcessor:
                 logger.error(f"Input file doesn't exist: {input_path}")
                 return False
             
-            # Create temporary file for metadata stripping
-            temp_stripped = self.temp_dir / f"{input_path.stem}_stripped{input_path.suffix}"
-            
             logger.info(f"Processing video: {input_path.name}")
+            logger.info("Stripping metadata and compressing video...")
             
-            # Step 1: Strip metadata
-            logger.info("Step 1/2: Stripping metadata...")
-            if not self.strip_metadata(input_path, temp_stripped):
+            # Process video (metadata stripping + compression in one pass)
+            if not self.compress_video_with_metadata_strip(input_path, output_path):
                 return False
-            
-            # Step 2: Compress video
-            logger.info("Step 2/2: Compressing video...")
-            if not self.compress_video(temp_stripped, output_path):
-                if temp_stripped.exists():
-                    temp_stripped.unlink()
-                return False
-            
-            # Cleanup temporary file
-            if temp_stripped.exists():
-                temp_stripped.unlink()
             
             logger.info(f"Processing complete: {output_path.name}")
             return True
@@ -399,7 +370,7 @@ Resolution Options:
 Examples:
   %(prog)s --quality medium
   %(prog)s --quality high --resolution 1080p
-  %(prog)s --watch-dir ~/firewatch/clips/uploads --output-dir ~/firewatch/clips/processed
+  %(prog)s --watch-dir ~/fireshare/uploads --output-dir ~/fireshare/processed
         """
     )
     
@@ -420,22 +391,22 @@ Examples:
     parser.add_argument(
         '--watch-dir',
         type=str,
-        default='~/firewatch/clips/uploads',
-        help='Directory to monitor for .processing files (default: ~/firewatch/clips/uploads)'
+        default='~/fireshare/uploads',
+        help='Directory to monitor for .processing files (default: ~/fireshare/uploads)'
     )
     
     parser.add_argument(
         '--output-dir',
         type=str,
-        default='~/firewatch/clips/uploads',
+        default='~/fireshare/uploads',
         help='Directory to output processed files (default: same as watch-dir)'
     )
     
     parser.add_argument(
         '--temp-dir',
         type=str,
-        default='~/firewatch/temp',
-        help='Temporary directory for processing (default: ~/firewatch/temp)'
+        default='~/fireshare/temp',
+        help='Temporary directory for processing (default: ~/fireshare/temp)'
     )
     
     args = parser.parse_args()

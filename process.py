@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Production-grade Fireshare processor with quality presets and robust Docker scan.
+Production-grade Fireshare processing daemon
 
-Key behavior:
+Behavior:
  - watch incoming .mp4.processing files
  - wait until stable, move to per-file workdir, rename to remove .processing
- - compress/strip metadata with ffmpeg (CRF presets)
- - move final .mp4 into output dir (Fireshare /videos mount)
- - run Docker scan command with safe filename substitution and retry/backoff
+ - compress + strip metadata with ffmpeg (quality presets)
+ - move final .mp4 into Fireshare /videos (output dir) using original filename when possible
+ - wait a small delay to let the container/video filesystem settle
+ - run Docker scan (retries/backoff)
+ - only after successful scan, generate poster thumbnail (so Fireshare's poster code doesn't race)
 """
 
 from __future__ import annotations
@@ -71,6 +73,7 @@ def setup_logging(debug: bool = False):
 
 logger = logging.getLogger("fireshare_processor")
 
+
 # ---------- Helpers ----------
 def safe_strip_suffix(name: str, suffix: str) -> str:
     if name.lower().endswith(suffix.lower()):
@@ -78,7 +81,13 @@ def safe_strip_suffix(name: str, suffix: str) -> str:
     return name
 
 
-def wait_for_stable(path: Path, timeout: int = DEFAULT_TIMEOUT, interval: float = DEFAULT_CHECK_INTERVAL, stable_checks: int = DEFAULT_STABLE_CHECKS) -> bool:
+def wait_for_stable(
+    path: Path,
+    timeout: int = DEFAULT_TIMEOUT,
+    interval: float = DEFAULT_CHECK_INTERVAL,
+    stable_checks: int = DEFAULT_STABLE_CHECKS,
+) -> bool:
+    """Wait until file size is stable for `stable_checks` checks."""
     start = time.time()
     last = -1
     stable = 0
@@ -104,7 +113,11 @@ def wait_for_stable(path: Path, timeout: int = DEFAULT_TIMEOUT, interval: float 
     return False
 
 
-def unique_final_name(output_dir: Path, base_name: str, preserve_name: bool = False) -> Path:
+def unique_final_name(output_dir: Path, base_name: str, preserve_name: bool = True) -> Path:
+    """
+    If preserve_name True, attempt to use base_name; append _1/_2 on collisions.
+    Otherwise use timestamp_uuid_base_name.
+    """
     base = Path(base_name)
     if preserve_name:
         candidate = output_dir / base.name
@@ -142,6 +155,7 @@ class FileProcessor:
         scan_cmd_template: Optional[str],
         preserve_name: bool,
         dry_run: bool = False,
+        scan_delay: float = 2.0,
     ):
         self.temp_dir = temp_dir
         self.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -151,6 +165,7 @@ class FileProcessor:
         self.scan_cmd_template = scan_cmd_template
         self.preserve_name = preserve_name
         self.dry_run = dry_run
+        self.scan_delay = scan_delay
         self._lock = threading.Lock()
 
         preset = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["medium"])
@@ -228,17 +243,50 @@ class FileProcessor:
         logger.info("ffmpeg success: %s -> %s", src.name, dst.name)
         return True
 
+    def _generate_poster(self, final_mp4: Path, poster_png: Path, time_position: float = 3.0) -> bool:
+        """
+        Use ffmpeg to extract a poster image at `time_position` seconds.
+        """
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-y",
+            "-i",
+            str(final_mp4),
+            "-ss",
+            str(time_position),
+            "-vframes",
+            "1",
+            "-vf",
+            "scale=320:-1",
+            str(poster_png),
+        ]
+
+        logger.info("Generating poster: %s", poster_png.name)
+        if self.dry_run:
+            logger.info("dry-run: poster cmd: %s", " ".join(cmd))
+            return True
+
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0:
+            logger.error("poster generation failed for %s: %s", final_mp4.name, proc.stderr[-500:])
+            return False
+        if not poster_png.exists() or poster_png.stat().st_size == 0:
+            logger.error("poster file missing: %s", poster_png)
+            return False
+        logger.info("Poster generated: %s", poster_png.name)
+        return True
+
     def _run_scan(self, final_path: Path, max_retries: int = 3, initial_backoff: float = 1.0) -> bool:
         """
         Run the configured scan command safely. Template must use {filename} placeholder.
-        This uses simple string replacement (no .format) to avoid KeyError/NameError issues.
+        Uses simple replace() to avoid KeyError/NameError.
         Retries on non-zero exit with exponential backoff.
         """
         if not self.scan_cmd_template:
             logger.debug("No scan command configured; skipping scan for %s", final_path)
             return True
 
-        # Safe substitution: only replace the {filename} token. This avoids template-format errors.
         cmd_str = self.scan_cmd_template.replace("{filename}", final_path.name)
         cmd = shlex.split(cmd_str)
 
@@ -251,7 +299,13 @@ class FileProcessor:
         for attempt in range(1, max_retries + 1):
             try:
                 res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                logger.info("scan attempt=%d exit=%s stdout=%s stderr=%s", attempt, res.returncode, (res.stdout or "").strip(), (res.stderr or "").strip())
+                logger.info(
+                    "scan attempt=%d exit=%s stdout=%s stderr=%s",
+                    attempt,
+                    res.returncode,
+                    (res.stdout or "").strip(),
+                    (res.stderr or "").strip(),
+                )
                 if res.returncode == 0:
                     return True
                 else:
@@ -267,6 +321,7 @@ class FileProcessor:
         return False
 
     def process(self, src_path: Path) -> bool:
+        """Process a single .mp4.processing file end-to-end."""
         logger.info("Starting processing: %s", src_path)
         if not wait_for_stable(src_path):
             logger.error("File not stable: %s", src_path)
@@ -282,6 +337,7 @@ class FileProcessor:
                 logger.exception("Failed to move to workdir: %s", exc)
                 return False
 
+            # Strip suffixes
             clean_name = safe_strip_suffix(temp_raw.name, ".processing")
             clean_name = safe_strip_suffix(clean_name, ".processed")
             if not clean_name.lower().endswith(".mp4"):
@@ -291,11 +347,13 @@ class FileProcessor:
             temp_mp4 = workdir / clean_name
             temp_raw.rename(temp_mp4)
 
+            # Compress into temp file
             compressed_temp = workdir / "compressed_output.mp4"
             if not self._run_ffmpeg(temp_mp4, compressed_temp):
                 logger.error("Compression failed for %s", temp_mp4)
                 return False
 
+            # Move compressed into final location in output_dir (preserve original name when possible)
             final = unique_final_name(self.output_dir, temp_mp4.name, preserve_name=self.preserve_name)
             try:
                 shutil.move(str(compressed_temp), str(final))
@@ -305,11 +363,28 @@ class FileProcessor:
 
             logger.info("Moved final video to: %s", final)
 
+            # small delay to allow filesystem/container to observe the new file
+            if self.scan_delay and self.scan_delay > 0:
+                logger.debug("Sleeping %.1fs before scanning to let container pick up file", self.scan_delay)
+                time.sleep(self.scan_delay)
+
             # Run container scan (with retries/backoff)
             scan_ok = self._run_scan(final)
             if not scan_ok:
                 logger.warning("Scan reported failure for %s", final)
+                # still continue (we've already moved file); poster generation may be skipped
+                return False
 
+            # Only after a successful scan do we create the poster (so Fireshare's poster logic won't race)
+            poster_file = final.with_suffix(".poster.png")
+            try:
+                ok = self._generate_poster(final, poster_file)
+                if not ok:
+                    logger.warning("Poster generation failed for %s", final.name)
+            except Exception as exc:
+                logger.exception("Poster generation exception for %s: %s", final.name, exc)
+
+            logger.info("Finished processing %s", final.name)
             return True
         finally:
             if workdir:
@@ -395,6 +470,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resolution", choices=["1080p", "720p", "auto"], default="1080p", help="Target resolution (scale+pad). 'auto' leaves original resolution")
     p.add_argument("--preserve-name", action="store_true", help="Attempt to preserve original filename in output directory (append suffix on conflict)")
     p.add_argument("--scan-cmd", default="docker exec fireshare fireshare scan-video --path /videos/{filename}", help="Command template to run after moving final file. Use {filename} to interpolate the MP4 filename inside the container path.")
+    p.add_argument("--scan-delay", type=float, default=2.0, help="Seconds to wait after moving file before scanning (helps container see new file)")
     p.add_argument("--dry-run", action="store_true", help="Do everything except actually run ffmpeg/move files (useful for testing)")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
     return p
@@ -428,6 +504,7 @@ def main():
         scan_cmd_template=args.scan_cmd,
         preserve_name=args.preserve_name,
         dry_run=args.dry_run,
+        scan_delay=args.scan_delay,
     )
 
     executor = ThreadPoolExecutor(max_workers=max(1, args.concurrency))
@@ -439,7 +516,8 @@ def main():
 
     install_signal_handlers(observer, executor)
 
-    logger.info("Started processor. Watching %s -> output %s (temp %s). concurrency=%d quality=%s resolution=%s", watch_dir, output_dir, temp_dir, args.concurrency, args.quality, args.resolution)
+    logger.info("Started processor. Watching %s -> output %s (temp %s). concurrency=%d quality=%s resolution=%s scan_delay=%.1f",
+                watch_dir, output_dir, temp_dir, args.concurrency, args.quality, args.resolution, args.scan_delay)
 
     try:
         while not shutdown_event.is_set():
